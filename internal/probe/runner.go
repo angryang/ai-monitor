@@ -121,6 +121,13 @@ func (r *Runner) Run(ctx context.Context, t config.TaskConfig) Result {
 		r.maybeAlert(t, res, log)
 		return res
 	}
+	if err := t.ValidateProtocolSegments(); err != nil {
+		res.Err = fmt.Errorf("task config: %w", err)
+		log.Warn("task_validate_failed", slog.String("err", res.Err.Error()))
+		r.sinkFailure(t, "4xx", 0, log)
+		r.maybeAlert(t, res, log)
+		return res
+	}
 	if verr := adapter.Validate(&t); verr != nil {
 		res.Err = fmt.Errorf("validate: %w", verr)
 		log.Warn("adapter_validate_failed", slog.String("err", res.Err.Error()))
