@@ -1,0 +1,73 @@
+# Prometheus alert rules for ai-monitor.
+#
+# Wire via:
+#   rule_files:
+#     - /etc/prometheus/rules/ai-monitor.yaml
+# Then `promtool check rules deploy/prometheus-alerts.yaml` validates it.
+# Each rule matches a corresponding internal alert; we keep both layers so
+# operators get a single notification surface even if the in-process
+# notifier is disabled (env=AI_MONITOR_NOTIFY=false or Notify.Enabled=false).
+
+groups:
+  - name: ai-monitor.rules
+    interval: 30s
+    rules:
+      # Rule 1: 401/403 → critical & immediate.
+      - alert: AIProbeUnauthorized
+        expr: increase(ai_probe_failure_total{error_type="unauthorized"}[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "AI probe unauthorized: {{ $labels.task_id }}"
+          description: "Task {{ $labels.task_id }} on {{ $labels.protocol }}/{{ $labels.model }} returned unauthorized."
+
+      # Rule 2: request duration P95 > 20s for 10 minutes.
+      - alert: AIProbeSlowDuration
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le, task_id, protocol, model) (
+              rate(ai_probe_request_duration_seconds_bucket[5m])
+            )
+          ) > 20
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AI probe P95 duration > 20s for {{ $labels.task_id }}"
+          description: "{{ $labels.protocol }}/{{ $labels.model }} on {{ $labels.task_id }} shows degradation."
+
+      # Rule 3: TTFT P95 > 10s for 10 minutes.
+      - alert: AIProbeSlowTTFT
+        expr: |
+          histogram_quantile(0.95,
+            sum by (le, task_id, protocol, model) (
+              rate(ai_probe_ttft_seconds_bucket[5m])
+            )
+          ) > 10
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AI probe P95 TTFT > 10s for {{ $labels.task_id }}"
+
+      # Rule 4: success rate < 80% over 5 minutes.
+      - alert: AIProbeLowSuccessRate
+        expr: |
+          (sum by (task_id, protocol, model) (rate(ai_probe_request_total{status="success"}[5m]))
+           /
+           sum by (task_id, protocol, model) (rate(ai_probe_request_total[5m]))) < 0.8
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AI probe success rate < 80% for {{ $labels.task_id }}"
+
+      # Rule 5: scheduler lag P95 > 5s (cron thrashing).
+      - alert: AIProbeSchedulerLag
+        expr: histogram_quantile(0.95, sum by (le, task_id) (rate(ai_probe_scheduler_lag_seconds_bucket[5m]))) > 5
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "AI probe scheduler lag > 5s for {{ $labels.task_id }}"
