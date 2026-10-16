@@ -5,7 +5,6 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -77,13 +76,10 @@ func TestWatchReloader_PropagateError(t *testing.T) {
 // TestWatchReloader_StopCleansUp ensures Run's goroutine returns after Stop.
 func TestWatchReloader_StopCleansUp(t *testing.T) {
 	fl := &fakeLister{ch: make(chan config.Event, 1)}
-	var mu sync.Mutex
 	r := NewWatchReloader(fl, func(_ context.Context, _ []config.TaskConfig) error { return nil }, nil)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go r.Run(ctx)
 	time.Sleep(20 * time.Millisecond)
-	mu.Lock()
-	_ = mu
 	r.Stop()
 }

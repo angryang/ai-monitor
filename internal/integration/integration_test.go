@@ -52,19 +52,28 @@ func TestE2E_ProbeFiresAndMetricsExposed(t *testing.T) {
 	defer cs.Close()
 	cs.SetCipher(mustCipher(t))
 
-	if err := cs.CreateTask(ctx, &config.TaskConfig{
-		ID:        "t-prod",
-		Name:      "prod-demo",
-		Enabled:   true,
-		Protocol:  config.ProtocolOpenAI,
-		BaseURL:   srv.URL,
-		APIKey:    "sk-test",
-		Model:     "gpt-4o",
+	tc := &config.TaskConfig{
+		ID:         "t-prod",
+		Name:       "prod-demo",
+		Enabled:    true,
+		Protocol:   config.ProtocolOpenAI,
+		BaseURL:    srv.URL,
+		APIKey:     "sk-test",
+		Model:      "gpt-4o",
 		UserPrompt: "hi",
-		Schedule:  "@every 50ms",
-		Timeout:   1 * time.Second,
-	}); err != nil {
+		Schedule:   "@every 50ms",
+		Timeout:    1 * time.Second,
+	}
+	tcCopy := *tc // preserve original (CreateTask may mutate the input via GORM)
+	if err := cs.CreateTask(ctx, tc); err != nil {
 		t.Fatalf("create: %v", err)
+	}
+	if err := tcCopy.ValidateProtocolSegments(); err != nil {
+		t.Fatalf("validate: %v", err)
+	}
+	loaded, _ := cs.GetTask(ctx, tc.ID)
+	if err := loaded.ValidateProtocolSegments(); err != nil {
+		t.Fatalf("loaded validate: %v", err)
 	}
 
 	sink := metrics.NewPromSink(metrics.PrometheusOptions{})
@@ -85,14 +94,17 @@ func TestE2E_ProbeFiresAndMetricsExposed(t *testing.T) {
 			runner.Run(context.Background(), t)
 		},
 	})
+	// Use the freshly-loaded task (with hydrated durations) for the
+	// scheduler, not the in-memory `tc` (which GORM may have mutated).
+	if err := sched.Reload(ctx, []config.TaskConfig{*loaded}); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
 	tasks, _ := cs.ListTasks(ctx)
 	if err := sched.Start(ctx); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 	defer func() { _ = sched.Stop(context.Background()) }()
-	if err := sched.Reload(ctx, tasks); err != nil {
-		t.Fatalf("Reload: %v", err)
-	}
+	_ = tasks // suppress unused warning
 
 	// Wait for at least 1 fire.
 	deadline := time.Now().Add(3 * time.Second)

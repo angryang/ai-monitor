@@ -360,6 +360,20 @@ func decodeJSONColumns(t *TaskConfig) error {
 	if err := t.Hydrate(); err != nil {
 		return err
 	}
+	// Collapse "embedded" fields back to nil if their customisable columns
+	// are empty (i.e. GORM reconstructed them only because the column had a
+	// default value). This keeps the protocol-segment validator accurate.
+	// MaxTokens == 0 means the column was NULL on read (NOT NULL DEFAULT 1024
+	// would otherwise make every Anthropic struct non-zero).
+	if t.OpenAI != nil && t.OpenAI.StreamPath == "" && t.OpenAI.ExtraHeadersJSON == "" {
+		t.OpenAI = nil
+	}
+	if t.Anthropic != nil && t.Anthropic.ExtraHeadersJSON == "" && (t.Anthropic.MaxTokens == 0 || t.Anthropic.MaxTokens == 1024) {
+		t.Anthropic = nil
+	}
+	if t.Gemini != nil && t.Gemini.ExtraHeadersJSON == "" && (t.Gemini.Alt == "" || t.Gemini.Alt == "sse") {
+		t.Gemini = nil
+	}
 	if len(t.APIKeyEnc) > 0 {
 		// Decryption happens in B3 once the cipher is wired up. We do NOT
 		// touch APIKeyEnc here — leaving the raw ciphertext in memory at
