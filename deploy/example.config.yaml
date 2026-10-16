@@ -1,0 +1,42 @@
+# ai-monitor · example runtime config
+#
+# Layer order: defaults < this file < env (AI_MONITOR_*) < --flag
+# Restart required after edit; per-task CRUD goes through /admin or sqlite.
+
+sqlite_path: ai-monitor.db
+http_addr: ":9090"
+
+max_concurrent: 16
+jitter: 250ms
+
+# Alerting
+slow_threshold: 10s
+consec_failure_n: 3
+success_rate_window: 200
+success_rate_threshold: 0.8
+dedup_ttl: 5m
+
+# Buckets (per design.md §11.6.1)
+buckets_default: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30]
+buckets_ttft:    [0.01, 0.025, 0.05, 0.1, 0.2, 0.35, 0.5, 0.75, 1, 2, 5]
+buckets_itl:     [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5]
+buckets_duration: [0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30, 60, 120]
+buckets_lag:     [0.01, 0.05, 0.1, 0.5, 1, 5, 30, 60]
+
+tasks:
+  - name: prod-openai-gpt4o
+    enabled: true
+    protocol: openai
+    base_url: https://api.openai.com
+    model: gpt-4o
+    schedule: "*/30 * * * * *"
+    timeout: 30s
+    user_prompt: "Say hi at ${today}"
+    prompt_vars:
+      today: "{{.Now.Date}}"
+    openai:
+      stream_path: /v1/chat/completions
+    notify:
+      enabled: true
+      channel: wecom
+      wecom_webhook: ${WECOM_WEBHOOK}
