@@ -2,6 +2,8 @@ package config
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -16,9 +18,10 @@ import (
 // SqliteStore is the default ConfigStore implementation. It owns a single
 // GORM-managed connection to a SQLite database file.
 type SqliteStore struct {
-	db   *gorm.DB
-	mu   sync.RWMutex // protects callers mapping JSON-typed columns
-	opts SqliteOptions
+	db     *gorm.DB
+	cipher Cipher // optional; encrypts API keys + wecom webhooks on disk
+	mu     sync.RWMutex
+	opts   SqliteOptions
 }
 
 // SqliteOptions carries tunables for SqliteStore. Zero-values fall back to
@@ -60,6 +63,20 @@ func NewSqliteStore(opts SqliteOptions) (*SqliteStore, error) {
 	return &SqliteStore{db: db, opts: opts}, nil
 }
 
+// SetCipher attaches an encryption backend. Pass nil to disable encryption.
+func (s *SqliteStore) SetCipher(c Cipher) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.cipher = c
+}
+
+// cipherOrNil returns the configured cipher under a read-lock.
+func (s *SqliteStore) cipherOrNil() Cipher {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.cipher
+}
+
 // ListTasks returns every row in the table. Refreshes the runtime-only JSON
 // columns on the way out.
 func (s *SqliteStore) ListTasks(ctx context.Context) ([]TaskConfig, error) {
@@ -69,6 +86,9 @@ func (s *SqliteStore) ListTasks(ctx context.Context) ([]TaskConfig, error) {
 	}
 	for i := range rows {
 		if err := decodeJSONColumns(&rows[i]); err != nil {
+			return nil, err
+		}
+		if err := s.decodeSecrets(&rows[i]); err != nil {
 			return nil, err
 		}
 	}
@@ -85,6 +105,9 @@ func (s *SqliteStore) GetTask(ctx context.Context, id string) (*TaskConfig, erro
 		return nil, fmt.Errorf("config: get %s: %w", id, err)
 	}
 	if err := decodeJSONColumns(&row); err != nil {
+		return nil, err
+	}
+	if err := s.decodeSecrets(&row); err != nil {
 		return nil, err
 	}
 	return &row, nil
@@ -177,6 +200,53 @@ func (s *SqliteStore) preWrite(t *TaskConfig) error {
 			return err
 		}
 	}
+	// Encrypt API key (if cipher attached) — silently keep ciphertext as-is
+	// when the input is empty and ciphertext exists.
+	c := s.cipherOrNil()
+	if c != nil {
+		if t.APIKey != "" {
+			enc, err := c.Encrypt([]byte(t.APIKey))
+			if err != nil {
+				return fmt.Errorf("config: encrypt api_key: %w", err)
+			}
+			t.APIKeyEnc = enc
+		}
+		if t.Notify.WeComWebhook != "" {
+			enc, err := c.Encrypt([]byte(t.Notify.WeComWebhook))
+			if err != nil {
+				return fmt.Errorf("config: encrypt wecom webhook: %w", err)
+			}
+			t.Notify.WeComWebhookEnc = enc
+		}
+	}
+	// Always zero plaintext secrets after the write.
+	t.APIKey = ""
+	t.Notify.WeComWebhook = ""
+	return nil
+}
+
+// decodeSecrets reverses preWrite's encryption step. Decryption failures
+// surface as errors so callers (probe runner) can decide policy. Missing
+// ciphertext results in empty strings.
+func (s *SqliteStore) decodeSecrets(t *TaskConfig) error {
+	c := s.cipherOrNil()
+	if c == nil {
+		return nil
+	}
+	if len(t.APIKeyEnc) > 0 && t.APIKey == "" {
+		raw, err := c.Decrypt(t.APIKeyEnc)
+		if err != nil {
+			return fmt.Errorf("config: decrypt api_key: %w", err)
+		}
+		t.APIKey = string(raw)
+	}
+	if len(t.Notify.WeComWebhookEnc) > 0 && t.Notify.WeComWebhook == "" {
+		raw, err := c.Decrypt(t.Notify.WeComWebhookEnc)
+		if err != nil {
+			return fmt.Errorf("config: decrypt wecom webhook: %w", err)
+		}
+		t.Notify.WeComWebhook = string(raw)
+	}
 	return nil
 }
 
@@ -188,6 +258,99 @@ func (s *SqliteStore) Close() error {
 		return fmt.Errorf("config: get sql.DB: %w", err)
 	}
 	return sqlDB.Close()
+}
+
+// Watch starts a background poller that compares row fingerprints on every
+// PollInterval tick. When a row's fingerprint changes (update or new row)
+// it pushes an Event with Type=EventUpsert; when a row disappears, EventDelete
+// is pushed. Callers must drain the channel or the buffered queue will fill
+// and the poller will block.
+func (s *SqliteStore) Watch(ctx context.Context) (<-chan Event, error) {
+	if s.opts.PollInterval <= 0 {
+		return nil, fmt.Errorf("config: poll interval must be > 0")
+	}
+	// Snapshot the initial state so we only emit diffs.
+	snapshot, err := s.fingerprintAll(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("config: snapshot: %w", err)
+	}
+	out := make(chan Event, 64)
+	ticker := time.NewTicker(s.opts.PollInterval)
+	go func() {
+		defer ticker.Stop()
+		defer close(out)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				current, err := s.fingerprintAll(ctx)
+				if err != nil {
+					continue // transient DB error; try again next tick
+				}
+				for id, fp := range current {
+					if old, ok := snapshot[id]; !ok || old != fp {
+						select {
+						case out <- Event{Type: EventUpsert, TaskID: id, At: time.Now().UTC()}:
+						case <-ctx.Done():
+							return
+						}
+					}
+				}
+				for id := range snapshot {
+					if _, ok := current[id]; !ok {
+						select {
+						case out <- Event{Type: EventDelete, TaskID: id, At: time.Now().UTC()}:
+						case <-ctx.Done():
+							return
+						}
+					}
+				}
+				snapshot = current
+			}
+		}
+	}()
+	return out, nil
+}
+
+// fingerprintAll returns a map of task id -> fingerprint. The fingerprint is
+// the SHA-256 of the row + secret column. Using hash avoids recomputing the
+// full ciphertext on every tick.
+func (s *SqliteStore) fingerprintAll(ctx context.Context) (map[string]string, error) {
+	type fpRow struct {
+		ID            string
+		Name          string
+		Enabled       bool
+		Protocol      string
+		BaseURL       string
+		APIKeyEnc     []byte
+		Model         string
+		PromptVars    string
+		Schedule      string
+		TimeoutMS     int64
+		CanaryGroup   string
+		NotifyEnabled bool
+		WebhookEnc    []byte
+		OpenAIEnc     string
+		AnthropicEnc  string
+		GeminiEnc     string
+	}
+	var rows []fpRow
+	if err := s.db.WithContext(ctx).
+		Table(TaskConfigTableName).
+		Select("id, name, enabled, protocol, base_url, api_key_enc, model, prompt_vars, schedule, timeout_ms, canary_group, enabled as notify_enabled, wecom_webhook_enc as webhook_enc, openai_extra_headers as openai_enc, anthropic_extra_headers as anthropic_enc, gemini_extra_headers as gemini_enc").
+		Scan(&rows).Error; err != nil {
+		return nil, fmt.Errorf("config: fingerprint scan: %w", err)
+	}
+	out := make(map[string]string, len(rows))
+	for _, r := range rows {
+		h := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%t|%s|%s|%x|%s|%s|%s|%d|%s|%t|%x|%s|%s|%s",
+			r.ID, r.Name, r.Enabled, r.Protocol, r.BaseURL, r.APIKeyEnc, r.Model,
+			r.PromptVars, r.Schedule, r.TimeoutMS, r.CanaryGroup, r.NotifyEnabled,
+			r.WebhookEnc, r.OpenAIEnc, r.AnthropicEnc, r.GeminiEnc)))
+		out[r.ID] = hex.EncodeToString(h[:])
+	}
+	return out, nil
 }
 
 // decodeJSONColumns fills in the PromptVars map and the *Protocol structs
