@@ -1,0 +1,459 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "description": "AI 服务监控与指标统计系统 · LLM 拨测 · 分位数趋势看板。配套 ai-monitor /metrics 端点使用。详见 docs/design.md。",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "type": "row",
+      "title": "概览",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 0},
+      "collapsed": false,
+      "id": 100,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "title": "活跃任务数",
+      "id": 1,
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "count(count by (task_id) (ai_probe_request_total{protocol=~\"$protocol\", model=~\"$model\"}))",
+          "legendFormat": "tasks"
+        }
+      ],
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "colorMode": "value",
+        "graphMode": "none"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "总探测速率（rpm）",
+      "id": 2,
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "sum(rate(ai_probe_request_total{protocol=~\"$protocol\", model=~\"$model\"}[5m])) * 60",
+          "legendFormat": "rpm"
+        }
+      ],
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "成功率（5m）",
+      "id": 3,
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "sum(rate(ai_probe_request_total{protocol=~\"$protocol\", model=~\"$model\", status=\"success\"}[5m])) / clamp_min(sum(rate(ai_probe_request_total{protocol=~\"$protocol\", model=~\"$model\"}[5m])), 1)",
+          "legendFormat": "success rate"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "red", "value": null},
+              {"color": "yellow", "value": 0.8},
+              {"color": "green", "value": 0.95}
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "colorMode": "value",
+        "graphMode": "area"
+      }
+    },
+    {
+      "type": "stat",
+      "title": "未恢复的失败任务",
+      "id": 4,
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 1},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "(count(count by (task_id) (ai_probe_request_total{protocol=~\"$protocol\", model=~\"$model\"})) - count(count by (task_id) (ai_probe_task_last_success_timestamp_seconds{protocol=~\"$protocol\", model=~\"$model\"} > (time() - 600))))",
+          "legendFormat": "down"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {"color": "green", "value": null},
+              {"color": "red", "value": 1}
+            ]
+          }
+        }
+      },
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false},
+        "colorMode": "value",
+        "graphMode": "none"
+      }
+    },
+    {
+      "type": "row",
+      "title": "TTFT 分位数趋势（P50 / P90 / P95 / P99）",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 5},
+      "collapsed": false,
+      "id": 101,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "TTFT P50",
+      "id": 10,
+      "gridPos": {"h": 7, "w": 12, "x": 0, "y": 6},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le, protocol, model) (rate(ai_probe_ttft_seconds_bucket{protocol=~\"$protocol\", model=~\"$model\"}[$__rate_interval])))",
+          "legendFormat": "{{protocol}} · {{model}} · P50"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {"drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 5, "showPoints": "never"},
+          "min": 0
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi"}
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "TTFT P90",
+      "id": 11,
+      "gridPos": {"h": 7, "w": 12, "x": 12, "y": 6},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.90, sum by (le, protocol, model) (rate(ai_probe_ttft_seconds_bucket{protocol=~\"$protocol\", model=~\"$model\"}[$__rate_interval])))",
+          "legendFormat": "{{protocol}} · {{model}} · P90"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {"drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 5, "showPoints": "never"},
+          "min": 0
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi"}
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "TTFT P95",
+      "id": 12,
+      "gridPos": {"h": 7, "w": 12, "x": 0, "y": 13},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, protocol, model) (rate(ai_probe_ttft_seconds_bucket{protocol=~\"$protocol\", model=~\"$model\"}[$__rate_interval])))",
+          "legendFormat": "{{protocol}} · {{model}} · P95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {"drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 5, "showPoints": "never"},
+          "min": 0
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi"}
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "TTFT P99",
+      "id": 13,
+      "gridPos": {"h": 7, "w": 12, "x": 12, "y": 13},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, protocol, model) (rate(ai_probe_ttft_seconds_bucket{protocol=~\"$protocol\", model=~\"$model\"}[$__rate_interval])))",
+          "legendFormat": "{{protocol}} · {{model}} · P99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {"drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 5, "showPoints": "never"},
+          "min": 0
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi"}
+      }
+    },
+    {
+      "type": "row",
+      "title": "会话时长分位数趋势（Duration P50 / P90 / P95 / P99）",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 20},
+      "collapsed": false,
+      "id": 102,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Duration P50",
+      "id": 20,
+      "gridPos": {"h": 7, "w": 12, "x": 0, "y": 21},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le, protocol, model) (rate(ai_probe_request_duration_seconds_bucket{protocol=~\"$protocol\", model=~\"$model\", status=\"success\"}[$__rate_interval])))",
+          "legendFormat": "{{protocol}} · {{model}} · P50"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {"drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 5, "showPoints": "never"},
+          "min": 0
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi"}
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Duration P90",
+      "id": 21,
+      "gridPos": {"h": 7, "w": 12, "x": 12, "y": 21},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.90, sum by (le, protocol, model) (rate(ai_probe_request_duration_seconds_bucket{protocol=~\"$protocol\", model=~\"$model\", status=\"success\"}[$__rate_interval])))",
+          "legendFormat": "{{protocol}} · {{model}} · P90"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {"drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 5, "showPoints": "never"},
+          "min": 0
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi"}
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Duration P95",
+      "id": 22,
+      "gridPos": {"h": 7, "w": 12, "x": 0, "y": 28},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le, protocol, model) (rate(ai_probe_request_duration_seconds_bucket{protocol=~\"$protocol\", model=~\"$model\", status=\"success\"}[$__rate_interval])))",
+          "legendFormat": "{{protocol}} · {{model}} · P95"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {"drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 5, "showPoints": "never"},
+          "min": 0
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi"}
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Duration P99",
+      "id": 23,
+      "gridPos": {"h": 7, "w": 12, "x": 12, "y": 28},
+      "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, protocol, model) (rate(ai_probe_request_duration_seconds_bucket{protocol=~\"$protocol\", model=~\"$model\", status=\"success\"}[$__rate_interval])))",
+          "legendFormat": "{{protocol}} · {{model}} · P99"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {"drawStyle": "line", "lineInterpolation": "smooth", "fillOpacity": 5, "showPoints": "never"},
+          "min": 0
+        }
+      },
+      "options": {
+        "legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull", "max"]},
+        "tooltip": {"mode": "multi"}
+      }
+    },
+    {
+      "type": "row",
+      "title": "辅助 · ITL · 错误 · 调度",
+      "gridPos": {"h": 1, "w": 24, "x": 0, "y": 35},
+      "collapsed": true,
+      "id": 103,
+      "panels": [
+        {
+          "type": "timeseries",
+          "title": "ITL P95（生成流畅度）",
+          "id": 30,
+          "gridPos": {"h": 7, "w": 12, "x": 0, "y": 36},
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "targets": [
+            {
+              "expr": "histogram_quantile(0.95, sum by (le, protocol, model) (rate(ai_probe_itl_seconds_bucket{protocol=~\"$protocol\", model=~\"$model\"}[$__rate_interval])))",
+              "legendFormat": "{{protocol}} · {{model}}"
+            }
+          ],
+          "fieldConfig": {"defaults": {"unit": "s", "min": 0}}
+        },
+        {
+          "type": "timeseries",
+          "title": "错误率（按协议 + 模型）",
+          "id": 31,
+          "gridPos": {"h": 7, "w": 12, "x": 12, "y": 36},
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "targets": [
+            {
+              "expr": "1 - (sum by (protocol, model) (rate(ai_probe_request_total{protocol=~\"$protocol\", model=~\"$model\", status=\"success\"}[5m])) / clamp_min(sum by (protocol, model) (rate(ai_probe_request_total{protocol=~\"$protocol\", model=~\"$model\"}[5m])), 1))",
+              "legendFormat": "{{protocol}} · {{model}}"
+            }
+          ],
+          "fieldConfig": {"defaults": {"unit": "percentunit"}}
+        },
+        {
+          "type": "timeseries",
+          "title": "失败细分（按 error_type）",
+          "id": 32,
+          "gridPos": {"h": 7, "w": 12, "x": 0, "y": 43},
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "targets": [
+            {
+              "expr": "sum by (protocol, model, error_type) (rate(ai_probe_failure_total{protocol=~\"$protocol\", model=~\"$model\"}[5m]))",
+              "legendFormat": "{{protocol}} · {{model}} · {{error_type}}"
+            }
+          ],
+          "fieldConfig": {"defaults": {"unit": "short"}}
+        },
+        {
+          "type": "timeseries",
+          "title": "调度延迟（schedule lag）",
+          "id": 33,
+          "gridPos": {"h": 7, "w": 12, "x": 12, "y": 43},
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "targets": [
+            {
+              "expr": "ai_probe_scheduler_lag_seconds{protocol=~\"$protocol\", model=~\"$model\"}",
+              "legendFormat": "{{task_id}}"
+            }
+          ],
+          "fieldConfig": {"defaults": {"unit": "s", "min": 0}}
+        },
+        {
+          "type": "timeseries",
+          "title": "Chunk 接收数量",
+          "id": 34,
+          "gridPos": {"h": 7, "w": 12, "x": 0, "y": 50},
+          "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+          "targets": [
+            {
+              "expr": "rate(ai_probe_chunk_total{protocol=~\"$protocol\", model=~\"$model\"}[5m])",
+              "legendFormat": "{{protocol}} · {{model}}"
+            }
+          ],
+          "fieldConfig": {"defaults": {"unit": "short"}}
+        }
+      ]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "style": "dark",
+  "tags": ["ai-monitor", "llm", "probe"],
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "label": "Prometheus 数据源",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {"selected": false, "text": "Prometheus", "value": "Prometheus"},
+        "hide": 0
+      },
+      {
+        "name": "protocol",
+        "label": "协议（渠道）",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "query": {
+          "query": "label_values(ai_probe_ttft_seconds_bucket, protocol)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "current": {"selected": false, "text": ["All"], "value": ["$__all"]},
+        "multi": true,
+        "includeAll": true,
+        "refresh": 1
+      },
+      {
+        "name": "model",
+        "label": "模型",
+        "type": "query",
+        "datasource": {"type": "prometheus", "uid": "${DS_PROMETHEUS}"},
+        "query": {
+          "query": "label_values(ai_probe_ttft_seconds_bucket{protocol=~\"$protocol\"}, model)",
+          "refId": "PrometheusVariableQueryEditor-VariableQuery"
+        },
+        "current": {"selected": false, "text": ["All"], "value": ["$__all"]},
+        "multi": true,
+        "includeAll": true,
+        "refresh": 1
+      }
+    ]
+  },
+  "time": {
+    "from": "now-3h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "",
+  "title": "AI 服务监控 · LLM 拨测分位数趋势",
+  "uid": "ai-monitor-llm",
+  "version": 1,
+  "weekStart": ""
+}

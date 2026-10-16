@@ -1,0 +1,142 @@
+# AI 端点 · 灰度（Canary）流量拨测场景示例
+#
+# 本文件是 ai-monitor 的"灰度拨测"典型配置示例集合，对应 design.md §15 P1-C。
+# 字段语义详见 ../docs/design.md §11.3 TaskConfig 定义。
+#
+# 使用方式（运行时通过 /admin/tasks 或 SQLite CRUD 写入，本处仅展示形态）：
+#   1) ai-monitor 二进制启动后自动从 DB 加载 enabled=true 的任务
+#   2) header 透传由各协议 Adapter 在 HTTP 请求阶段注入
+#   3) Prometheus 通过 task_id 维度分别抓取 prod 与 canary 的 TTFT/ITL/成功率
+#   4) 看板建议按 task_id 拆分 + 计算差值（gray vs prod 同比 / 环比）
+#
+# 安全护栏（自动生效）：
+#   - 拒绝对系统头（Host / Content-Length / Connection）注入
+#   - 拒绝对 Authorization 注入（避免凭据冲突）
+#   - stream_path 必须以 / 开头
+#   - apikey 从 DB 读出后由 Runner 解密注入，绝不进 header 配置
+
+tasks:
+
+  # ============================================================
+  # 场景 A · 同域名通过 Header 触发网关 Canary 路由
+  # （典型：Cloudflare Workers / 阿里云 API 网关 / Envoy + Lua 路由）
+  # ============================================================
+  - name: prod-openai-gpt4o
+    enabled: true
+    protocol: openai
+    base_url: https://api.openai.com
+    apikey: ${OPENAI_PROD_KEY}
+    model: gpt-4o
+    schedule: "*/30 * * * * *"          # 每 30 秒
+    timeout: 30s
+    user_prompt: "请用一句话描述今天的日期：${today}"
+    prompt_vars:
+      today: "{{.Now.Date}}"
+    # === 无额外 header === 走默认 prod 路由
+
+  - name: canary-openai-gpt4o
+    enabled: true
+    protocol: openai
+    base_url: https://api.openai.com     # 同域名
+    apikey: ${OPENAI_PROD_KEY}           # 同凭据
+    model: gpt-4o
+    schedule: "*/30 * * * * *"
+    timeout: 30s
+    user_prompt: "请用一句话描述今天的日期：${today}"
+    prompt_vars:
+      today: "{{.Now.Date}}"
+    openai:
+      stream_path: /v1/chat/completions
+      # 关键：通过 header 让网关路由到 gray 环境
+      extra_headers:
+        X-Canary-Group: "gray-2024q3"           # 网关读此头决定 backend pool
+        X-Trace-Id: "{{.UUID}}"                 # 链路追踪，方便在网关日志对照
+        X-Env: "canary"                         # 可选
+        User-Agent: "ai-monitor/canary"         # 标识调用方身份
+    notify:
+      enabled: true
+      channel: wecom
+      wecom_webhook: ${WECOM_WEBHOOK_GRAY}
+
+  # ============================================================
+  # 场景 B · 跨实例 A/B 对比
+  # （可直接通过 Prometheus "task_id" 维度对比两者的 p95/p99）
+  # ============================================================
+  - name: prod-anthropic-claude
+    enabled: true
+    protocol: anthropic
+    base_url: https://api.anthropic.com
+    apikey: ${ANTHROPIC_PROD_KEY}
+    model: claude-3-5-sonnet-20241022
+    schedule: "*/60 * * * * *"
+    timeout: 45s
+    anthropic:
+      max_tokens: 1024
+    user_prompt: "简要解释什么是 TTFT"
+
+  - name: canary-anthropic-claude-v3
+    enabled: true
+    protocol: anthropic
+    base_url: https://canary.anthropic.internal   # 跨实例
+    apikey: ${ANTHROPIC_CANARY_KEY}
+    model: claude-3-5-sonnet-20241022
+    schedule: "*/60 * * * * *"
+    timeout: 45s
+    anthropic:
+      max_tokens: 1024
+      # 同样支持可插自定义头（用于内部 mTLS 网关或灰度标记）
+      extra_headers:
+        X-Release-Name: "claude-canary-v3"
+        X-Internal-Canary: "true"
+    user_prompt: "简要解释什么是 TTFT"
+
+  # ============================================================
+  # 场景 C · 租户级灰度
+  # （指定租户走 canary，其他租户走 prod）
+  # ============================================================
+  - name: tenant-canary-gemini
+    enabled: true
+    protocol: gemini
+    base_url: https://generativelanguage.googleapis.com
+    apikey: ${GEMINI_KEY}
+    model: gemini-1.5-pro
+    schedule: "0 */5 * * * *"           # 每 5 分钟
+    timeout: 60s
+    gemini:
+      alt: sse
+      extra_headers:
+        X-Tenant-Id: "tenant-canary-001"
+        X-Release-Channel: "canary"
+        X-User-Bucket: "gray-50pct"     # 服务端按 bucket 决定是否走新版本
+    user_prompt: "复述 'release canary is on' 这句话"
+
+# ============================================================
+# 配套 Prometheus 告警规则片段（详见 prometheus-alerts.yaml）
+# ============================================================
+#
+# - alert: CanaryTTFTRegression
+#   expr: |
+#     histogram_quantile(0.95,
+#       sum by (le, model) (
+#         rate(ai_probe_ttft_seconds_bucket{task_id=~"canary-.*"}[5m])
+#       )
+#     )
+#     >
+#     histogram_quantile(0.95,
+#       sum by (le, model) (
+#         rate(ai_probe_ttft_seconds_bucket{task_id=~"prod-.*"}[5m])
+#       )
+#     ) * 1.5
+#   for: 10m
+#   labels: { severity: warning }
+#   annotations:
+#     summary: "canary 端点 p95 TTFT 超过 prod 50%+"
+#
+# - alert: CanarySuccessRateDrop
+#   expr: |
+#     sum(rate(ai_probe_request_total{task_id=~"canary-.*",status="success"}[5m]))
+#     /
+#     sum(rate(ai_probe_request_total{task_id=~"canary-.*"}[5m]))
+#     < 0.9
+#   for: 5m
+#   labels: { severity: critical }
