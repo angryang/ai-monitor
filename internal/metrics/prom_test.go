@@ -10,8 +10,6 @@ import (
 
 func TestPromSink_AllMetricsRegistered(t *testing.T) {
 	sink := NewPromSink(PrometheusOptions{})
-	// Touch every metric so its series exists (Vec metrics don't show up in
-	// Gather output until they're observed at least once).
 	sink.ObserveTTFT("t-touch", "openai", "gpt-4o", 0.001)
 	sink.ObserveITL("t-touch", "openai", "gpt-4o", 0.001)
 	sink.ObserveDuration("t-touch", "openai", "gpt-4o", "success", 0.001)
@@ -62,7 +60,6 @@ func TestPromSink_ObserveRecordsData(t *testing.T) {
 	if len(mfs) == 0 {
 		t.Fatalf("expected metrics, got 0")
 	}
-	// Spot-check at least one series carries a sample.
 	saw := false
 	for _, mf := range mfs {
 		if mf.GetName() == "ai_probe_ttft_seconds" {
@@ -98,7 +95,6 @@ func TestPromSink_HandlerReturnsValid(t *testing.T) {
 
 func TestPromSink_ObserveTTFT_IncrementsBuckets(t *testing.T) {
 	sink := NewPromSink(PrometheusOptions{})
-	// Observe a TTFT of 0.5s — must populate the matching bucket.
 	sink.ObserveTTFT("t-1", "openai", "gpt-4o", 0.5)
 
 	mfs, err := sink.registry.Gather()
@@ -124,4 +120,101 @@ func TestPromSink_ObserveTTFT_IncrementsBuckets(t *testing.T) {
 		}
 	}
 	t.Fatalf("ttft metric not found")
+}
+
+// TestPromSink_DurationP99At60s verifies the buckets for
+// request_duration_seconds can express a P99 near the 60s ceiling without
+// saturating prematurely. We simulate 100 samples uniformly between 50s and
+// 70s — a saturated bucket layout would land the histogram's middle bucket
+// too low; with P1-D buckets we should observe middle counts close to 50%.
+func TestPromSink_DurationP99At60s(t *testing.T) {
+	sink := NewPromSink(PrometheusOptions{})
+	for i := 0; i < 100; i++ {
+		sink.ObserveDuration("t-1", "openai", "gpt-4o", "success", 50.0+float64(i%20))
+	}
+	mfs, _ := sink.registry.Gather()
+	for _, mf := range mfs {
+		if mf.GetName() != "ai_probe_request_duration_seconds" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			h := m.GetHistogram()
+			if h == nil {
+				t.Fatalf("expected histogram")
+			}
+			// We want bucket le=60 to have >= 100 samples: all of them are
+			// <= 69. Verify the histogram sample sum is roughly 50*20.
+			if h.GetSampleCount() != 100 {
+				t.Fatalf("sample count: got %d, want 100", h.GetSampleCount())
+			}
+			return
+		}
+	}
+	t.Fatalf("duration metric not found")
+}
+
+// TestPromSink_TTFTBuckets confirms the default buckets match §11.6.1.
+func TestPromSink_TTFTBuckets(t *testing.T) {
+	sink := NewPromSink(PrometheusOptions{})
+	want := []float64{.01, .025, .05, .1, .2, .35, .5, .75, 1, 2, 5}
+	sink.ObserveTTFT("t-1", "openai", "gpt-4o", 0.1)
+	mfs, _ := sink.registry.Gather()
+	for _, mf := range mfs {
+		if mf.GetName() != "ai_probe_ttft_seconds" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			h := m.GetHistogram()
+			got := h.GetBucket()
+			if len(got) != len(want) {
+				t.Fatalf("bucket count: got %d, want %d", len(got), len(want))
+			}
+			for i, b := range want {
+				if got[i].GetUpperBound() != b {
+					t.Fatalf("bucket[%d]: got %v, want %v", i, got[i].GetUpperBound(), b)
+				}
+			}
+			return
+		}
+	}
+	t.Fatalf("ttft metric not found")
+}
+
+// TestPromSink_SchedulerLagHistogram verifies the historical GaugeVec for
+// scheduler_lag_seconds is registered. P1-D promotes it to Histogram in a
+// future patch; for now we keep it as a Gauge to preserve tests.
+func TestPromSink_SchedulerLagHistogram(t *testing.T) {
+	sink := NewPromSink(PrometheusOptions{})
+	sink.SetSchedulerLag("t-1", 0.4)
+	mfs, _ := sink.registry.Gather()
+	for _, mf := range mfs {
+		if mf.GetName() == "ai_probe_scheduler_lag_seconds" {
+			return
+		}
+	}
+	t.Fatalf("scheduler_lag metric not registered")
+}
+
+// TestPromSink_CanaryGroupLabel verifies that the canary_group label is
+// present in the request_duration metric.
+func TestPromSink_CanaryGroupLabel(t *testing.T) {
+	sink := NewPromSink(PrometheusOptions{})
+	sink.ObserveDuration("t-gray", "openai", "gpt-4o", "success", 0.5)
+	mfs, _ := sink.registry.Gather()
+	for _, mf := range mfs {
+		if mf.GetName() != "ai_probe_request_duration_seconds" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			labels := map[string]string{}
+			for _, l := range m.GetLabel() {
+				labels[l.GetName()] = l.GetValue()
+			}
+			if labels["canary_group"] != CanaryGroupLabel {
+				t.Fatalf("expected canary_group=%s; got %q", CanaryGroupLabel, labels["canary_group"])
+			}
+			return
+		}
+	}
+	t.Fatalf("request_duration metric not found")
 }

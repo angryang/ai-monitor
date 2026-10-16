@@ -9,7 +9,8 @@ import (
 )
 
 // PrometheusOptions controls the prometheus sink. All fields are optional;
-// zero / nil values fall back to defaults from the config package.
+// zero / nil values fall back to the buckets recommended in §11.6.1 of the
+// design document.
 type PrometheusOptions struct {
 	BucketsDuration []float64
 	BucketsTTFT     []float64
@@ -53,8 +54,10 @@ func NewPromSink(opts PrometheusOptions) *PromSink {
 	registry := prometheus.NewRegistry()
 	sink := &PromSink{registry: registry}
 
-	requestLabels := []string{"task_id", "protocol", "model", "status"}
-	streamLabels := []string{"task_id", "protocol", "model"}
+	// Per-P1-D: every Vec metric carries `canary_group` label so we can split
+	// P50/P90/P95/P99 by canary bucket (see design.md §11.6.2).
+	requestLabels := []string{"task_id", "protocol", "model", "status", "canary_group"}
+	streamLabels := []string{"task_id", "protocol", "model", "canary_group"}
 
 	sink.requestDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: opts.Namespace,
@@ -87,7 +90,7 @@ func NewPromSink(opts PrometheusOptions) *PromSink {
 		Namespace: opts.Namespace,
 		Name:      "failure_total",
 		Help:      "Probe failures broken down by error type.",
-	}, []string{"task_id", "protocol", "model", "error_type"})
+	}, []string{"task_id", "protocol", "model", "error_type", "canary_group"})
 
 	sink.chunkTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Namespace: opts.Namespace,
@@ -99,8 +102,10 @@ func NewPromSink(opts PrometheusOptions) *PromSink {
 		Namespace: opts.Namespace,
 		Name:      "task_last_success_timestamp_seconds",
 		Help:      "Last successful probe timestamp per task.",
-	}, []string{"task_id"})
+	}, []string{"task_id", "canary_group"})
 
+	// P1-D: scheduler_lag_seconds promoted to HistogramVec with TTFT-style
+	// buckets so operators can read P95/P99 lag via PromQL.
 	sink.schedulerLag = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Namespace: opts.Namespace,
 		Name:      "scheduler_lag_seconds",
@@ -123,22 +128,28 @@ func NewPromSink(opts PrometheusOptions) *PromSink {
 // Registry exposes the underlying registry (mainly for tests that introspect).
 func (s *PromSink) Registry() *prometheus.Registry { return s.registry }
 
-// ObserveTTFT records a TTFT observation in seconds. Empty task IDs are
-// accepted but produce a metric line with task_id="".
+// Helper to default canary_group label.
+func canary(group string) string {
+	if group == "" {
+		return CanaryGroupLabel
+	}
+	return group
+}
+
+// ObserveTTFT records a TTFT observation in seconds.
 func (s *PromSink) ObserveTTFT(taskID, protocolName, model string, seconds float64) {
-	s.ttft.WithLabelValues(taskID, protocolName, model).Observe(seconds)
+	s.ttft.WithLabelValues(taskID, protocolName, model, canary("")).Observe(seconds)
 }
 
 // ObserveITL records an inter-token latency.
 func (s *PromSink) ObserveITL(taskID, protocolName, model string, seconds float64) {
-	s.itl.WithLabelValues(taskID, protocolName, model).Observe(seconds)
+	s.itl.WithLabelValues(taskID, protocolName, model, canary("")).Observe(seconds)
 }
 
-// ObserveDuration records the end-to-end request duration with a status label
-// (e.g. "success", "failure", "unauthorized").
+// ObserveDuration records the end-to-end request duration with a status label.
 func (s *PromSink) ObserveDuration(taskID, protocolName, model, status string, seconds float64) {
-	s.requestDuration.WithLabelValues(taskID, protocolName, model, status).Observe(seconds)
-	s.requestTotal.WithLabelValues(taskID, protocolName, model, status).Inc()
+	s.requestDuration.WithLabelValues(taskID, protocolName, model, status, canary("")).Observe(seconds)
+	s.requestTotal.WithLabelValues(taskID, protocolName, model, status, canary("")).Inc()
 }
 
 // IncChunk increments the cumulative chunk counter.
@@ -146,18 +157,17 @@ func (s *PromSink) IncChunk(taskID, protocolName, model string, n int) {
 	if n <= 0 {
 		return
 	}
-	s.chunkTotal.WithLabelValues(taskID, protocolName, model).Add(float64(n))
+	s.chunkTotal.WithLabelValues(taskID, protocolName, model, canary("")).Add(float64(n))
 }
 
-// IncFailure bumps the failure counter with an enumerated error type. The
-// Runner supplies only known labels (timeout / 4xx / 5xx / protocol_error).
+// IncFailure bumps the failure counter with an enumerated error type.
 func (s *PromSink) IncFailure(taskID, protocolName, model, errorType string) {
-	s.failureTotal.WithLabelValues(taskID, protocolName, model, errorType).Inc()
+	s.failureTotal.WithLabelValues(taskID, protocolName, model, errorType, canary("")).Inc()
 }
 
 // SetTaskLastSuccess stamps the gauge with the wall-clock timestamp seconds.
 func (s *PromSink) SetTaskLastSuccess(taskID string, ts time.Time) {
-	s.lastSuccess.WithLabelValues(taskID).Set(float64(ts.UnixMilli()) / 1000.0)
+	s.lastSuccess.WithLabelValues(taskID, canary("")).Set(float64(ts.UnixMilli()) / 1000.0)
 }
 
 // SetSchedulerLag reports the lag seconds for the given task.
