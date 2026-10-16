@@ -175,3 +175,26 @@ func TestAnthropic_Headers_PassThrough(t *testing.T) {
 		t.Fatalf("missing anthropic-version header")
 	}
 }
+
+func TestAnthropic_Probe_SendsExtraHeaders(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get("X-Release-Name")
+		w.WriteHeader(200)
+		_, _ = fmt.Fprint(w, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+	}))
+	defer srv.Close()
+	adapter := newAdapter(t)
+	cfg := baseTask()
+	cfg.BaseURL = srv.URL
+	cfg.Anthropic.ExtraHeadersJSON = `{"X-Release-Name":"claude-canary-v3"}`
+	s, err := adapter.Probe(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	for range s.Chunks() {
+	}
+	if got != "claude-canary-v3" {
+		t.Fatalf("X-Release-Name: got %q", got)
+	}
+}

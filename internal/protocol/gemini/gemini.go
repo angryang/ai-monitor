@@ -119,6 +119,12 @@ func (a *Adapter) Probe(ctx context.Context, cfg *config.TaskConfig) (protocol.P
 	q.Set("key", key)
 	req.URL.RawQuery = q.Encode()
 	req.Header.Set("User-Agent", a.ua)
+	if cfg.Gemini != nil {
+		if err := protocol.ApplyExtraHeaders(req, cfg.Gemini.ExtraHeadersJSON); err != nil {
+			cancel()
+			return nil, fmt.Errorf("gemini: %w: %w", err, protocol.ErrProtocolCfg)
+		}
+	}
 
 	resp, err := a.http.Do(req)
 	if err != nil {

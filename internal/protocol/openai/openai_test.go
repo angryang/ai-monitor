@@ -15,6 +15,8 @@ import (
 	"github.com/aibench/aibench/ai-monitor/internal/protocol"
 )
 
+var _ = strings.Contains // keep import used
+
 func newAdapter(t *testing.T) *Adapter {
 	t.Helper()
 	a, err := protocol.Lookup("openai")
@@ -204,5 +206,54 @@ func TestOpenAI_Probe_Headers(t *testing.T) {
 	}
 	if captured.UA == "" {
 		t.Fatalf("UA: empty")
+	}
+}
+
+func TestOpenAI_Probe_SendsExtraHeaders(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get("X-Canary-Group")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+	adapter := newAdapter(t)
+	cfg := baseTask()
+	cfg.BaseURL = srv.URL
+	cfg.OpenAI = &config.OpenAIConfig{StreamPath: "/v1/chat/completions", ExtraHeadersJSON: `{"X-Canary-Group":"gray-2024q3","X-Trace-Id":"abc"}`}
+	s, err := adapter.Probe(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	for range s.Chunks() {
+	}
+	if got != "gray-2024q3" {
+		t.Fatalf("X-Canary-Group: got %q", got)
+	}
+}
+
+func TestOpenAI_Probe_AuthHeaderNotOverridden(t *testing.T) {
+	adapter := newAdapter(t)
+	cfg := baseTask()
+	cfg.OpenAI = &config.OpenAIConfig{ExtraHeadersJSON: `{"Authorization":"Bearer fake"}`}
+	_, err := adapter.Probe(context.Background(), cfg)
+	if err == nil {
+		t.Fatalf("expected blacklist error")
+	}
+	if !errors.Is(err, protocol.ErrProtocolCfg) {
+		t.Fatalf("err: %v", err)
+	}
+}
+
+func TestExtraHeaders_BlackList(t *testing.T) {
+	for _, header := range []string{"Host", "Content-Length", "Connection", "Authorization"} {
+		req, _ := http.NewRequest(http.MethodPost, "http://example", nil)
+		err := protocol.ApplyExtraHeaders(req, `{"`+header+`":"x"}`)
+		if err == nil {
+			t.Fatalf("expected error for %s", header)
+		}
+		if !errors.Is(err, protocol.ErrBlacklistHeader) {
+			t.Fatalf("%s: got %v", header, err)
+		}
 	}
 }

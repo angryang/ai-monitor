@@ -127,6 +127,12 @@ func (a *Adapter) Probe(ctx context.Context, cfg *config.TaskConfig) (protocol.P
 	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
 	req.Header.Set("User-Agent", a.ua)
 	req.Header.Set("Accept", "text/event-stream")
+	if cfg.OpenAI != nil {
+		if err := protocol.ApplyExtraHeaders(req, cfg.OpenAI.ExtraHeadersJSON); err != nil {
+			cancel()
+			return nil, fmt.Errorf("openai: %w: %w", err, protocol.ErrProtocolCfg)
+		}
+	}
 
 	resp, err := a.http.Do(req)
 	if err != nil {

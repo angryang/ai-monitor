@@ -163,3 +163,26 @@ func TestGemini_Headers_QueryKey(t *testing.T) {
 		t.Fatalf("key: got %q", capturedKey)
 	}
 }
+
+func TestGemini_Probe_SendsExtraHeaders(t *testing.T) {
+	var got string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Get("X-Tenant-Id")
+		w.WriteHeader(200)
+		_, _ = fmt.Fprint(w, `[{"candidates":[{"content":{"parts":[{"text":"ok"}]},"finishReason":"STOP"}]}]`)
+	}))
+	defer srv.Close()
+	adapter := newAdapter(t)
+	cfg := baseTask()
+	cfg.BaseURL = srv.URL
+	cfg.Gemini.ExtraHeadersJSON = `{"X-Tenant-Id":"tenant-canary-001"}`
+	s, err := adapter.Probe(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	for range s.Chunks() {
+	}
+	if got != "tenant-canary-001" {
+		t.Fatalf("X-Tenant-Id: got %q", got)
+	}
+}

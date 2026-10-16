@@ -122,6 +122,12 @@ func (a *Adapter) Probe(ctx context.Context, cfg *config.TaskConfig) (protocol.P
 	req.Header.Set("anthropic-version", "2023-06-01")
 	req.Header.Set("User-Agent", a.ua)
 	req.Header.Set("Accept", "text/event-stream")
+	if cfg.Anthropic != nil {
+		if err := protocol.ApplyExtraHeaders(req, cfg.Anthropic.ExtraHeadersJSON); err != nil {
+			cancel()
+			return nil, fmt.Errorf("anthropic: %w: %w", err, protocol.ErrProtocolCfg)
+		}
+	}
 
 	resp, err := a.http.Do(req)
 	if err != nil {
