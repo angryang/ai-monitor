@@ -5,9 +5,34 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"time"
 )
+
+// jsonMarshal serialises a map to JSON or returns the empty string.
+func jsonMarshal(m map[string]string) (string, error) {
+	if len(m) == 0 {
+		return "", nil
+	}
+	raw, err := json.Marshal(m)
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
+}
+
+// jsonUnmarshalStringMap decodes a JSON object into a map[string]string.
+func jsonUnmarshalStringMap(raw string) (map[string]string, error) {
+	if raw == "" {
+		return nil, nil
+	}
+	var out map[string]string
+	if err := json.Unmarshal([]byte(raw), &out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
 
 // Protocol enumerates the supported chat protocols.
 type Protocol string
@@ -38,6 +63,14 @@ const (
 // canary bucket. See design.md §17.1 / P1-D for the rationale on this label.
 const CanaryGroupLabel = "default"
 
+// TaskConfigTableName is the SQL table name used for persisted rows. We
+// override GORM's pluralization to keep the name aligned with design.md §12.
+const TaskConfigTableName = "tasks"
+
+// TableName satisfies GORM's Tabler interface. Pinning the name avoids the
+// default pluralization (`task_configs`) which would otherwise be applied.
+func (TaskConfig) TableName() string { return TaskConfigTableName }
+
 // TaskConfig is the persisted representation of a probe task. The struct is
 // GORM-tagged so SQLite can store it as a single row (see store_sqlite.go).
 //
@@ -49,19 +82,21 @@ const CanaryGroupLabel = "default"
 // column-flattening by default; we still surround them with `,embedded` so
 // future schema migrations treat them uniformly.
 type TaskConfig struct {
-	ID           string            `gorm:"primaryKey;size:64" yaml:"id"`
-	Name         string            `gorm:"uniqueIndex;size:128;not null" yaml:"name" validate:"required,min=1,max=128"`
-	Enabled      bool              `gorm:"not null;default:true" yaml:"enabled"`
-	Protocol     Protocol          `gorm:"size:32;not null" yaml:"protocol" validate:"required,oneof=openai anthropic gemini"`
-	BaseURL      string            `gorm:"size:512;not null" yaml:"base_url" validate:"required,url"`
-	APIKey       string            `gorm:"-"` // runtime only; loaded by store
-	APIKeyEnc    []byte            `gorm:"column:api_key_enc;type:blob"`
-	Model        string            `gorm:"size:128;not null" yaml:"model" validate:"required"`
-	SystemPrompt string            `gorm:"type:text" yaml:"system_prompt,omitempty"`
-	UserPrompt   string            `gorm:"type:text" yaml:"user_prompt" validate:"required"`
-	PromptVars   map[string]string `gorm:"type:text" yaml:"prompt_vars,omitempty"` // JSON
-	Schedule     string            `gorm:"size:128;not null" yaml:"schedule" validate:"required"`
-	Timeout      time.Duration     `gorm:"not null;default:30s" yaml:"timeout" validate:"min=1s,max=10m"`
+	ID             string `gorm:"primaryKey;size:64" yaml:"id"`
+	Name           string `gorm:"uniqueIndex;size:128;not null" yaml:"name" validate:"required,min=1,max=128"`
+	Enabled        bool   `gorm:"not null;default:true" yaml:"enabled"`
+	Protocol       Protocol `gorm:"size:32;not null" yaml:"protocol" validate:"required,oneof=openai anthropic gemini"`
+	BaseURL        string `gorm:"size:512;not null" yaml:"base_url" validate:"required,url"`
+	APIKey         string `gorm:"-"` // runtime only; loaded by store
+	APIKeyEnc      []byte `gorm:"column:api_key_enc;type:blob"`
+	Model          string `gorm:"size:128;not null" yaml:"model" validate:"required"`
+	SystemPrompt   string `gorm:"type:text" yaml:"system_prompt,omitempty"`
+	UserPrompt     string `gorm:"type:text" yaml:"user_prompt" validate:"required"`
+	PromptVars     map[string]string `gorm:"-" yaml:"prompt_vars,omitempty"` // runtime: decoded from PromptVarsJSON
+	PromptVarsJSON string `gorm:"column:prompt_vars;type:text"`              // persistent JSON form
+	Schedule       string `gorm:"size:128;not null" yaml:"schedule" validate:"required"`
+	Timeout        time.Duration `gorm:"-" yaml:"timeout" validate:"min=1s,max=10m"`
+	TimeoutMS      int64  `gorm:"column:timeout_ms;not null;default:30000"`
 	CanaryGroup  string            `gorm:"size:64;not null;default:default" yaml:"canary_group,omitempty"`
 	Notify       NotifyConfig      `gorm:"embedded" yaml:"notify,omitempty"`
 	OpenAI       *OpenAIConfig     `gorm:"embedded" yaml:"openai,omitempty"`
@@ -77,6 +112,52 @@ type NotifyConfig struct {
 	Channel         NotifyChannel `gorm:"size:32;not null;default:wecom" yaml:"channel" validate:"omitempty,oneof=wecom"`
 	WeComWebhook    string        `gorm:"-"` // runtime only
 	WeComWebhookEnc []byte        `gorm:"column:wecom_webhook_enc;type:blob"`
+}
+
+// EffectiveTimeout returns Timeout if non-zero, otherwise the design default
+// of 30 seconds. It also normalises the TimeoutMS column to the Timeout field
+// for symmetry across create / read paths.
+func (t *TaskConfig) EffectiveTimeout() time.Duration {
+	if t.Timeout > 0 {
+		return t.Timeout
+	}
+	if t.TimeoutMS > 0 {
+		return time.Duration(t.TimeoutMS) * time.Millisecond
+	}
+	return 30 * time.Second
+}
+
+// Normalise pulls Duration / map fields into the persistent integer / JSON
+// columns. Called before any Create/Update so the SQLite schema always holds
+// a numeric form.
+func (t *TaskConfig) Normalise() error {
+	if t.Timeout > 0 {
+		t.TimeoutMS = t.Timeout.Milliseconds()
+	}
+	if len(t.PromptVars) > 0 {
+		raw, err := jsonMarshal(t.PromptVars)
+		if err != nil {
+			return fmt.Errorf("config: prompt_vars: %w", err)
+		}
+		t.PromptVarsJSON = raw
+	}
+	return nil
+}
+
+// Hydrate fills the runtime Duration / API-Key fields from the persistent
+// columns after a read.
+func (t *TaskConfig) Hydrate() error {
+	if t.Timeout == 0 && t.TimeoutMS > 0 {
+		t.Timeout = time.Duration(t.TimeoutMS) * time.Millisecond
+	}
+	if t.PromptVarsJSON != "" && len(t.PromptVars) == 0 {
+		m, err := jsonUnmarshalStringMap(t.PromptVarsJSON)
+		if err != nil {
+			return fmt.Errorf("config: prompt_vars decode: %w", err)
+		}
+		t.PromptVars = m
+	}
+	return nil
 }
 
 // OpenAIConfig is the protocol-specific block for OpenAI-compatible APIs.
