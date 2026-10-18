@@ -1,3 +1,6 @@
+// Copyright (c) 2026 yangchun <825660677@qq.com>
+// SPDX-License-Identifier: MIT
+
 // Package protocol defines the chat-protocol adapter contract that
 // OpenAI/Anthropic/Gemini implement. The actual implementations live in
 // subdirectories and register themselves at init() time.

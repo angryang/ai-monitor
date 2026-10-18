@@ -151,3 +151,17 @@ deploy/
 ## Version
 
 Latest tag is `v0.1.0-P1`. See `docs/design.md` for the full design history.
+
+## Maintainer
+
+- **yangchun** — [825660677@qq.com](mailto:825660677@qq.com)
+
+Issues, security reports, and feature requests are welcome. For security
+vulnerabilities please email the maintainer directly rather than opening a
+public issue.
+
+## License
+
+[MIT](./LICENSE) © 2026 yangchun. Anyone may use, modify, and redistribute
+this software (including for commercial purposes), provided the copyright
+notice and permission notice in `LICENSE` are preserved.

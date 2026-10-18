@@ -1,3 +1,6 @@
+// Copyright (c) 2026 yangchun <825660677@qq.com>
+// SPDX-License-Identifier: MIT
+
 // Package server: /admin/users handlers — full CRUD with role-aware
 // visibility. Viewers always get 403; admins get full control except for
 // the "can't delete yourself" + "can't delete last admin" safety rails.

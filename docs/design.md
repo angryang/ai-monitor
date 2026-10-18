@@ -230,7 +230,7 @@ MetricSink
 ### 完整 `go.mod`
 
 ```go
-module github.com/aibench/aibench/ai-monitor
+module github.com/angryang/ai-monitor
 
 go 1.25
 

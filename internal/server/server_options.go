@@ -1,3 +1,6 @@
+// Copyright (c) 2026 yangchun <825660677@qq.com>
+// SPDX-License-Identifier: MIT
+
 // Package server: optional auth-related fields for the Server's Options
 // struct. Keeping them in a separate file prevents http.go from growing
 // any further while still letting callers wire everything through the

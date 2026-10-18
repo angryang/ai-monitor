@@ -1,3 +1,6 @@
+// Copyright (c) 2026 yangchun <825660677@qq.com>
+// SPDX-License-Identifier: MIT
+
 // Package webui embeds the compiled SPA (Vite output) into the binary so the
 // admin dashboard ships as a single artifact. During development the embed
 // returns nothing — internal/server/static.go swaps to disk via the `dev` build

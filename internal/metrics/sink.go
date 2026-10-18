@@ -1,3 +1,6 @@
+// Copyright (c) 2026 yangchun <825660677@qq.com>
+// SPDX-License-Identifier: MIT
+
 // Package metrics defines the MetricSink abstraction used by the runner.
 // The default implementation (PromSink) reports to Prometheus via pull mode.
 package metrics

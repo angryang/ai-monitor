@@ -1,3 +1,6 @@
+// Copyright (c) 2026 yangchun <825660677@qq.com>
+// SPDX-License-Identifier: MIT
+
 // Package probe owns the orchestration logic. This file defines the
 // persistent record of a single probe execution. One ProbeRun row is
 // written per Run() invocation; rows are kept capped (see retention) so the

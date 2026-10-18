@@ -1,3 +1,6 @@
+// Copyright (c) 2026 yangchun <825660677@qq.com>
+// SPDX-License-Identifier: MIT
+
 package protocol
 
 // Response-body capture helper (§18.13). When an ai-monitor probe streams

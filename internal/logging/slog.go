@@ -1,3 +1,6 @@
+// Copyright (c) 2026 yangchun <825660677@qq.com>
+// SPDX-License-Identifier: MIT
+
 // Package logging centralizes slog initialization so that every package can
 // pull a single JSON-handler logger with consistent fields (time, level, msg,
 // and any extras injected via WithAttrs/With).

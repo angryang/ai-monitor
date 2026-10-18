@@ -1,3 +1,6 @@
+// Copyright (c) 2026 yangchun <825660677@qq.com>
+// SPDX-License-Identifier: MIT
+
 // Package server: /admin/tasks CRUD with RBAC. Viewers can read; only
 // admins can create / update / delete. Secret columns (apikey, webhook)
 // are encrypted server-side and **never** returned to the client.

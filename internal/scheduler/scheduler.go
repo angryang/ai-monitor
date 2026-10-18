@@ -1,3 +1,6 @@
+// Copyright (c) 2026 yangchun <825660677@qq.com>
+// SPDX-License-Identifier: MIT
+
 // Package scheduler owns cron-driven execution of probe tasks. It wraps
 // robfig/cron/v3 with a weighted semaphore so concurrent tasks respect
 // MaxConcurrent, and applies random jitter so clusters don't thunder.

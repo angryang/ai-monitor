@@ -1,3 +1,6 @@
+// Copyright (c) 2026 yangchun <825660677@qq.com>
+// SPDX-License-Identifier: MIT
+
 // Command ai-monitor is the single-entry-point binary that loads config,
 // opens the SQLite task store, schedules probes, and exposes /metrics +
 // /healthz + /admin endpoints. Per design.md §10, the cmd/* package holds

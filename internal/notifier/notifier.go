@@ -1,3 +1,6 @@
+// Copyright (c) 2026 yangchun <825660677@qq.com>
+// SPDX-License-Identifier: MIT
+
 // Package notifier defines the AlertEvent / Notifier contract and provides a
 // shared MultiNotifier fan-out. Concrete backends (e.g. wecom) live in
 // subpackages.

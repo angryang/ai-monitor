@@ -1,3 +1,6 @@
+// Copyright (c) 2026 yangchun <825660677@qq.com>
+// SPDX-License-Identifier: MIT
+
 // Package server wires the HTTP surface area: /metrics, /healthz, /admin/*,
 // and (since §18) /auth/* + SPA fallback. The cmd/* package hands us a
 // pre-built *auth.Middleware; we apply it on the appropriate sub-mux so the

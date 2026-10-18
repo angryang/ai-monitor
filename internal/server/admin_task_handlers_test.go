@@ -1,3 +1,6 @@
+// Copyright (c) 2026 yangchun <825660677@qq.com>
+// SPDX-License-Identifier: MIT
+
 package server
 
 // Tests for §18.12 start / stop handlers. We exercise the handler funcs

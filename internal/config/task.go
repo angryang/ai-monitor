@@ -1,3 +1,6 @@
+// Copyright (c) 2026 yangchun <825660677@qq.com>
+// SPDX-License-Identifier: MIT
+
 // Package config owns the declarative TaskConfig model plus the runtime
 // configuration loader (yaml < env < flag). All cross-task config
 // structures live here so other packages can compile against stable

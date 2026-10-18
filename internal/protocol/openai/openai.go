@@ -1,3 +1,6 @@
+// Copyright (c) 2026 yangchun <825660677@qq.com>
+// SPDX-License-Identifier: MIT
+
 // Package openai implements the OpenAI-compatible streaming chat adapter.
 // It implements the protocol.ChatProtocolAdapter contract and is registered
 // at init-time via the package-level init() below.

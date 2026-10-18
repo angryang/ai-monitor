@@ -1,3 +1,6 @@
+// Copyright (c) 2026 yangchun <825660677@qq.com>
+// SPDX-License-Identifier: MIT
+
 // Package anthropic implements the Anthropic Messages streaming adapter.
 // It supports the standard event-stream format documented at
 // https://docs.anthropic.com/en/api/messages-streaming.

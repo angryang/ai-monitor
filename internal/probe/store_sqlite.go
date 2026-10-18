@@ -1,3 +1,6 @@
+// Copyright (c) 2026 yangchun <825660677@qq.com>
+// SPDX-License-Identifier: MIT
+
 // SQLite-backed implementation of probe.RunStore. We piggy-back on the same
 // ai-monitor.db file the config store uses — the schema lives in the same
 // migration epoch so `db.AutoMigrate` picks up `probe_runs` automatically

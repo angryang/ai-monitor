@@ -1,3 +1,6 @@
+// Copyright (c) 2026 yangchun <825660677@qq.com>
+// SPDX-License-Identifier: MIT
+
 // Package server: SPA static handler. Serves the embedded Vite build
 // (internal/webui/assets/) and falls back to index.html for unknown
 // routes so the SPA's client-side router takes over.

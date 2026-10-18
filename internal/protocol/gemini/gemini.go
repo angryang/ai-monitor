@@ -1,3 +1,6 @@
+// Copyright (c) 2026 yangchun <825660677@qq.com>
+// SPDX-License-Identifier: MIT
+
 // Package gemini implements the Google Gemini streaming adapter.
 // It supports the v1/streamGenerateContent endpoint, which returns a JSON
 // array of incremental responses (terminated when finishReason is set).

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 yangchun <825660677@qq.com>
+// SPDX-License-Identifier: MIT
+
 // Package auth implements login, JWT signing/parsing, bcrypt password
 // hashing, and the UserStore used by the admin dashboard. Per design.md
 // §18.1, two roles are recognised: admin and viewer. Higher tiers belong to

@@ -1,3 +1,6 @@
+// Copyright (c) 2026 yangchun <825660677@qq.com>
+// SPDX-License-Identifier: MIT
+
 // Package server: /auth/* handlers (login, logout, me, change-password).
 // Handlers are intentionally small: the heavy lifting (JWT, bcrypt) lives
 // in internal/auth and is wired in through the *auth.Middleware.
