@@ -1,0 +1,283 @@
+{
+  "common": {
+    "cancel": "取消",
+    "save": "保存",
+    "create": "创建",
+    "update": "更新",
+    "delete": "删除",
+    "edit": "编辑",
+    "open": "打开",
+    "back": "返回首页",
+    "loading": "加载中…",
+    "close": "关闭",
+    "dismiss": "关闭",
+    "enabled": "已启用",
+    "disabled": "已停用",
+    "paused": "已暂停",
+    "yes": "是",
+    "no": "否",
+    "unknownError": "未知错误"
+  },
+  "nav": {
+    "tasks": "监控任务",
+    "metrics": "监控指标",
+    "users": "用户管理",
+    "profile": "个人信息",
+    "controlPlane": "控制台",
+    "brand": "AI 服务监控系统"
+  },
+  "lang": {
+    "zh": "中文",
+    "en": "English",
+    "switchLabel": "语言"
+  },
+  "theme": {
+    "toggle": "主题",
+    "toDark": "切换到暗色",
+    "toLight": "切换到亮色"
+  },
+  "auth": {
+    "roleAdmin": "管理员",
+    "roleViewer": "观察者",
+    "logout": "退出登录",
+    "title": "控制台",
+    "subtitle": "登录以管理探测任务与用户",
+    "username": "用户名",
+    "password": "密码",
+    "signIn": "登 录",
+    "hint": "凭据由环境变量注入 · JWT HS256 · 12 小时有效"
+  },
+  "crumb": {
+    "tasks": "任务",
+    "tasksNew": "任务 · 新建",
+    "tasksEdit": "任务 · 编辑",
+    "tasksDetail": "任务 · 详情",
+    "tasksRuns": "任务 · 执行历史",
+    "metrics": "指标",
+    "users": "用户",
+    "profile": "个人",
+    "fallback": "ai-monitor"
+  },
+  "runs": {
+    "reload": "刷新",
+    "timeline": {
+      "title": "执行趋势",
+      "subtitle": "最近 {n} 次探测（最旧 → 最新）",
+      "total": "总次数",
+      "success": "成功率",
+      "failures": "失败",
+      "p95": "P95 时延",
+      "chartOld": "旧",
+      "chartNew": "新",
+      "peak": "峰值"
+    },
+    "status": {
+      "success": "成功",
+      "failure": "失败",
+      "unauthorized": "鉴权失败"
+    },
+    "row": {
+      "duration": "总耗时",
+      "itl": "ITL",
+      "chunks": "块数",
+      "errPrefix": "ERR",
+      "errNone": "无错误",
+      "copyErr": "复制完整错误",
+      "wire": {
+        "title": "Wire capture",
+        "request": "请求 body",
+        "responseHead": "响应 head",
+        "responseTail": "响应 tail",
+        "requestId": "X-Req-Id",
+        "truncated": "… 已截断",
+        "requestTruncatedNote": "请求体超过 32 KiB，已截断",
+        "responseTruncatedNote": "响应中部字节被丢弃（保留 head + tail 各 4 KiB）",
+        "missing": "—",
+        "copyReq": "复制完整请求 body",
+        "copyRespHead": "复制响应 head",
+        "copyRespTail": "复制响应 tail",
+        "show": "查看请求 / 响应"
+      }
+    },
+    "list": {
+      "title": "逐次记录",
+      "limit": "limit",
+      "emptyTitle": "尚无执行记录",
+      "emptyDesc": "新创建的探测任务需要等下一次 cron 触发才会写入第一条记录。"
+    }
+  },
+  "task": {
+    "list": {
+      "title": "任务",
+      "subtitle": "活跃的探测配置；悬停一行查看完整参数",
+      "new": "新建任务",
+      "emptyTitle": "暂无任务",
+      "emptyDesc": "创建一个任务，开始探测你的 AI 服务。"
+    },
+    "col": {
+      "name": "名称",
+      "protocol": "协议",
+      "model": "模型",
+      "schedule": "调度",
+      "status": "状态",
+      "updated": "更新时间"
+    },
+    "detail": {
+      "id": "ID",
+      "baseUrl": "基础地址",
+      "userPrompt": "用户提示词",
+      "canaryGroup": "灰度分组",
+      "apiKey": "API Key",
+      "webhook": "通知 Webhook",
+      "configured": "已配置（已加密）",
+      "notSet": "—",
+      "open": "打开",
+      "edit": "编辑",
+      "delete": "删除",
+      "runs": "执行历史",
+      "identity": "标识",
+      "schedule": "调度",
+      "prompts": "提示词",
+      "protocol": "协议",
+      "model": "模型",
+      "canary": "灰度",
+      "enabled": "启用",
+      "cron": "cron",
+      "timeout": "超时",
+      "systemLabel": "系统：",
+      "userLabel": "用户：",
+      "vars": "变量：{json}",
+      "deleteConfirmTitle": "删除任务？",
+      "deleteConfirmBody": "删除「{name}」将立即停止对该服务的探测。",
+      "start": "启动",
+      "stop": "停止",
+      "startConfirmTitle": "启动任务？",
+      "startConfirmBody": "将立刻按 cron 调度「{name}」，调度器会加入新一轮探测。",
+      "stopConfirmTitle": "停止任务？",
+      "stopConfirmBody": "将立刻取消「{name}」的 cron 调度，调度器不会再次 fire。",
+      "statusStopped": "已停止",
+      "statusRunning": "运行中"
+    },
+    "form": {
+      "editTitle": "编辑任务",
+      "newTitle": "新建任务",
+      "note": "API Key 与 Webhook 在服务端加密保存，响应中不会回显明文",
+      "name": "名称",
+      "protocol": "协议",
+      "baseUrl": "基础地址",
+      "apiKey": "API Key",
+      "apiKeyKeep": "API Key（留空表示不修改）",
+      "model": "模型",
+      "schedule": "调度",
+      "scheduleHint": "5–7 段的 cron 表达式",
+      "timeout": "超时",
+      "timeoutHint": "例如 30s",
+      "canary": "灰度分组",
+      "userPrompt": "用户提示词",
+      "systemPrompt": "系统提示词",
+      "notification": "通知设置",
+      "notifyEnabled": "启用",
+      "wecom": "企业微信 Webhook",
+      "wecomHint": "留空表示不修改",
+      "submitCreate": "创建",
+      "submitSave": "保存",
+      "cancel": "取消"
+    }
+  },
+  "user": {
+    "list": {
+      "title": "用户",
+      "subtitle": "管理管理员与观察者账号",
+      "new": "新建用户"
+    },
+    "col": {
+      "username": "用户名",
+      "display": "显示名",
+      "role": "角色",
+      "status": "状态",
+      "created": "创建时间"
+    },
+    "create": {
+      "title": "新建用户",
+      "username": "用户名",
+      "display": "显示名",
+      "password": "密码",
+      "role": "角色",
+      "submit": "创建",
+      "cancel": "取消"
+    },
+    "delete": {
+      "title": "删除用户？",
+      "body": "删除「{name}」将立即撤销其访问权限。"
+    },
+    "drawer": {
+      "id": "ID",
+      "username": "用户名",
+      "display": "显示名",
+      "role": "角色",
+      "enabled": "启用",
+      "createdAt": "创建时间",
+      "updatedAt": "更新时间"
+    }
+  },
+  "profile": {
+    "title": "个人",
+    "subtitle": "修改密码或查看当前会话",
+    "identity": "身份",
+    "username": "用户名",
+    "displayName": "显示名",
+    "role": "角色",
+    "sessionExpires": "会话过期时间",
+    "changePwd": "修改密码",
+    "currentPwd": "当前密码",
+    "newPwd": "新密码",
+    "newPwdHint": "至少 12 个字符",
+    "update": "更新"
+  },
+  "metrics": {
+    "title": "指标",
+    "placeholder": "TTFT / ITL / 时延 P50/P90/P95/P99 — T05 接入后可用"
+  },
+  "notFound": {
+    "title": "404",
+    "desc": "控制台中没有这个页面",
+    "action": "返回首页"
+  },
+  "forbidden": {
+    "title": "403 · 无权限",
+    "desc": "当前角色无法访问「{path}」",
+    "fallbackPath": "该页面",
+    "action": "返回首页"
+  },
+  "toast": {
+    "successLogin": "登录成功",
+    "welcomeBack": "欢迎回来，{name}",
+    "taskCreated": "任务已创建",
+    "taskUpdated": "任务已更新",
+    "taskDeleted": "任务已删除",
+    "taskStarted": "任务已启动",
+    "taskStopped": "任务已停止",
+    "userCreated": "用户已创建",
+    "userDeleted": "用户已删除",
+    "pwdChanged": "密码已修改",
+    "pwdChangedHint": "下次会话请重新登录",
+    "errLogin": "登录失败",
+    "errLoad": "加载失败",
+    "errUpdate": "更新失败",
+    "errCreate": "创建失败",
+    "errDelete": "删除失败",
+    "errStart": "启动失败",
+    "errStop": "停止失败",
+    "errChange": "修改失败"
+  },
+  "validation": {
+    "required": "必填",
+    "requiredField": "请填写 {label}",
+    "minLength": "至少 {n} 个字符",
+    "minLengthShort": "至少 {n} 个字符",
+    "url": "请输入合法的 URL",
+    "urlProtocol": "必须以 http:// 或 https:// 开头",
+    "cron": "cron 必须为 5–7 段",
+    "invalidRole": "角色无效"
+  }
+}

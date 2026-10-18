@@ -129,7 +129,9 @@ func (t *TaskConfig) EffectiveTimeout() time.Duration {
 
 // Normalise pulls Duration / map fields into the persistent integer / JSON
 // columns. Called before any Create/Update so the SQLite schema always holds
-// a numeric form.
+// a numeric form. Also provisions empty protocol blocks with safe defaults
+// so GORM's full-row Save() never writes NULL into NOT-NULL columns
+// (e.g. max_tokens, alt) when the user picked a different protocol.
 func (t *TaskConfig) Normalise() error {
 	if t.Timeout > 0 {
 		t.TimeoutMS = t.Timeout.Milliseconds()
@@ -140,6 +142,16 @@ func (t *TaskConfig) Normalise() error {
 			return fmt.Errorf("config: prompt_vars: %w", err)
 		}
 		t.PromptVarsJSON = raw
+	}
+	// Provision protocol-segment defaults so GORM never inserts NULL.
+	if t.OpenAI == nil {
+		t.OpenAI = &OpenAIConfig{StreamPath: ""}
+	}
+	if t.Anthropic == nil {
+		t.Anthropic = &AnthropicConfig{MaxTokens: 1024}
+	}
+	if t.Gemini == nil {
+		t.Gemini = &GeminiConfig{Alt: "sse"}
 	}
 	return nil
 }

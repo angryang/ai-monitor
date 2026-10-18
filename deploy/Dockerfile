@@ -15,7 +15,7 @@ RUN make build
 
 FROM scratch
 LABEL org.opencontainers.image.title="ai-monitor"
-LABEL org.opencontainers.image.source="https://github.com/aibench/aibench/ai-monitor"
+LABEL org.opencontainers.image.source="https://github.com/angryang/ai-monitor"
 
 # Static binaries only need CA + the binary + the timezone database.
 COPY --from=builder /usr/share/zoneinfo /usr/share/zoneinfo

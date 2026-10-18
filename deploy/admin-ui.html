@@ -1,0 +1,353 @@
+<!DOCTYPE html>
+<!--
+  ai-monitor 任务管理 UI · 单文件、零构建、零后端改动
+  ─────────────────────────────────────────────────────
+  用法 A（同源 / 反向代理）：把此文件交由任意 web server，与 ai-monitor:9090 同源即可
+  用法 B（跨域直连）：ai-monitor 启动时需开放 CORS，或用 nginx/caddy 反代
+  用法 C（嵌入到二进制，未来扩展）：在 main.go 用 //go:embed 嵌入 + 加一个 GET /admin/ 路由
+
+  当前后端 API：
+    GET    /admin/tasks      列出所有任务
+    POST   /admin/reload     触发从 DB 重载（hot reload）
+
+  ⚠️ 已知缺口：当前后端没有 POST /admin/tasks 与 DELETE /admin/tasks/:id 实现
+    ——本 UI 的「新建」和「删除」按钮目前会调用这些，会得到 404
+    下一步补丁：在 internal/server/http.go 增加
+      POST  /admin/tasks      （body = TaskConfig JSON，自动加密 apikey/webhook）
+      PATCH /admin/tasks/{id} （部分更新）
+      DELETE /admin/tasks/{id}（软删除 / 标记 enabled=false）
+-->
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<title>ai-monitor · 任务管理</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<script src="https://unpkg.com/vue@3.4.27/dist/vue.global.prod.js"></script>
+<style>
+  :root {
+    --bg: #f7f8fb; --panel: #ffffff; --ink: #1a2233; --ink-sub: #5a6478;
+    --line: #e6e8ee; --accent: #2f6feb; --danger: #d8443f; --ok: #14a06d;
+    --warn: #d6a514;
+    --pill-bg: #eef1f7;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.5 -apple-system, "SF Pro Text", "PingFang SC", system-ui, sans-serif;
+         background: var(--bg); color: var(--ink); }
+  .layout { max-width: 1200px; margin: 0 auto; padding: 24px; }
+  h1 { font-size: 20px; margin: 0 0 8px; }
+  .sub { color: var(--ink-sub); margin-bottom: 24px; font-size: 13px; }
+  .row { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; flex-wrap: wrap; }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px;
+          padding: 16px; box-shadow: 0 1px 2px rgba(20,30,60,0.04); }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; }
+  th, td { padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-weight: 600; color: var(--ink-sub); background: #fbfcfe; position: sticky; top: 0; }
+  tr:hover td { background: #fafbfd; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 999px;
+          font-size: 12px; background: var(--pill-bg); color: var(--ink-sub); margin-right: 4px; }
+  .pill.ok { color: var(--ok); background: #e7f7ef; }
+  .pill.warn { color: var(--warn); background: #fef4d7; }
+  .pill.danger { color: var(--danger); background: #fde7e6; }
+  .pill.protocol { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  input, select, textarea {
+    border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px;
+    font: inherit; background: #fff; color: var(--ink);
+  }
+  input:focus, select:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  button {
+    border: 1px solid var(--line); background: #fff; color: var(--ink);
+    padding: 6px 14px; border-radius: 6px; cursor: pointer; font: inherit;
+    transition: background .15s, border-color .15s;
+  }
+  button:hover { background: #f3f5fa; }
+  button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+  button.primary:hover { background: #2b62c8; }
+  button.danger { color: var(--danger); border-color: #f3c5c3; }
+  button.danger:hover { background: var(--danger); color: #fff; }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .modal-bg { position: fixed; inset: 0; background: rgba(20,30,60,.45);
+              display: flex; align-items: center; justify-content: center; z-index: 9999; }
+  .modal { background: #fff; border-radius: 12px; padding: 24px; max-width: 720px;
+           width: 92vw; max-height: 88vh; overflow: auto; box-shadow: 0 24px 64px rgba(20,30,60,0.25); }
+  .modal h2 { margin: 0 0 16px; font-size: 18px; }
+  .form-grid { display: grid; grid-template-columns: 140px 1fr; gap: 10px 14px; align-items: center; }
+  .form-grid label { color: var(--ink-sub); font-size: 13px; }
+  .form-grid input, .form-grid select, .form-grid textarea { width: 100%; }
+  .form-grid textarea { font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+                        font-size: 12px; min-height: 70px; }
+  .empty { padding: 32px; text-align: center; color: var(--ink-sub); }
+  .toast { position: fixed; top: 16px; right: 16px; padding: 10px 16px; border-radius: 8px;
+           background: var(--ink); color: #fff; font-size: 13px; opacity: 0;
+           transition: opacity .2s; pointer-events: none; z-index: 9999; }
+  .toast.show { opacity: 1; }
+  .toast.ok { background: var(--ok); }
+  .toast.err { background: var(--danger); }
+  .footer { color: var(--ink-sub); font-size: 12px; margin-top: 24px; text-align: right; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; background: #eef1f7;
+         padding: 1px 6px; border-radius: 4px; font-size: 12px; }
+</style>
+</head>
+<body>
+<div id="app" class="layout">
+  <h1>ai-monitor · 任务管理</h1>
+  <div class="sub">
+    后端: <code>{{ apiBase }}</code> ·
+    <a :href="apiBase + '/metrics'" target="_blank">/metrics</a> ·
+    <a :href="apiBase + '/healthz'" target="_blank">/healthz</a>
+  </div>
+
+  <div class="row">
+    <button @click="loadTasks" :disabled="loading">
+      {{ loading ? '刷新中…' : '刷新' }}
+    </button>
+    <button @click="reload" :disabled="reloading" class="primary">
+      {{ reloading ? '重载中…' : '触发热重载' }}
+    </button>
+    <button @click="openCreate" class="primary" :disabled="!canCreate">
+      + 新建任务
+    </button>
+    <span style="flex:1"></span>
+    <input v-model="filter" placeholder="过滤（按 name / protocol / model）" style="min-width:240px" />
+    <select v-model="protocolFilter">
+      <option value="">所有协议</option>
+      <option value="openai">openai</option>
+      <option value="anthropic">anthropic</option>
+      <option value="gemini">gemini</option>
+    </select>
+  </div>
+
+  <div class="card" style="padding: 0; overflow: hidden;">
+    <table v-if="filtered.length">
+      <thead>
+        <tr>
+          <th style="width: 26%">名称</th>
+          <th style="width: 12%">协议</th>
+          <th>端点</th>
+          <th>模型</th>
+          <th>调度</th>
+          <th>灰度</th>
+          <th style="width: 110px">启用</th>
+          <th style="width: 160px">操作</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr v-for="t in filtered" :key="t.ID">
+          <td>
+            <div style="font-weight:600;">{{ t.Name }}</div>
+            <div style="font-size:12px; color: var(--ink-sub);">id: <code>{{ t.ID }}</code></div>
+          </td>
+          <td>
+            <span class="pill protocol">{{ t.Protocol }}</span>
+            <div v-if="t.StreamPath" style="font-size:12px; color: var(--ink-sub);">{{ t.StreamPath }}</div>
+          </td>
+          <td>
+            <div style="font-family: ui-monospace, monospace; font-size:12px; word-break: break-all;">{{ t.BaseURL }}</div>
+          </td>
+          <td><code>{{ t.Model }}</code></td>
+          <td><code style="font-size:11px;">{{ t.Schedule }}</code></td>
+          <td>
+            <span class="pill" :class="{ warn: t.CanaryGroup && t.CanaryGroup !== 'default' }">
+              {{ t.CanaryGroup || 'default' }}
+            </span>
+          </td>
+          <td>
+            <span :class="['pill', t.Enabled ? 'ok' : 'danger']">
+              {{ t.Enabled ? '启用' : '停用' }}
+            </span>
+          </td>
+          <td>
+            <button @click="openEdit(t)" style="margin-right:6px">详情</button>
+            <button class="danger" :disabled="!canDelete" @click="del(t)">删除</button>
+          </td>
+        </tr>
+      </tbody>
+    </table>
+    <div v-else class="empty">没有任务。先点 <code>+ 新建任务</code>，或通过 SQLite 写入后刷新。</div>
+  </div>
+
+  <div class="footer">
+    当前实现：list + reload + 详情（API 已有） · 创建/删除需后端补 POST/DELETE /admin/tasks 路由
+  </div>
+
+  <!-- 新建/编辑 Modal -->
+  <div v-if="editing" class="modal-bg" @click.self="editing=null">
+    <div class="modal">
+      <h2>{{ editing.ID ? '任务详情：' + editing.Name : '新建任务' }}</h2>
+      <div class="form-grid">
+        <label>名称 *</label>     <input v-model="editing.Name" :disabled="!!editing.ID" />
+        <label>协议 *</label>     <select v-model="editing.Protocol" :disabled="!!editing.ID">
+          <option value="openai">openai</option>
+          <option value="anthropic">anthropic</option>
+          <option value="gemini">gemini</option>
+        </select>
+        <label>BaseURL *</label>  <input v-model="editing.BaseURL" placeholder="https://api.openai.com" />
+        <label>API Key *</label>  <input type="password" v-model="editing.APIKeyPlain" placeholder="sk-...（保存时加密入库）" />
+        <label>模型 *</label>     <input v-model="editing.Model" placeholder="gpt-4o / claude-3-5-sonnet / gemini-1.5-pro" />
+        <label>System Prompt</label>   <textarea v-model="editing.SystemPrompt"></textarea>
+        <label>User Prompt *</label>   <textarea v-model="editing.UserPrompt"></textarea>
+        <label>Schedule *</label>      <input v-model="editing.Schedule" placeholder="*/30 * * * * *（秒级 cron）" />
+        <label>Timeout (sec)</label>   <input v-model.number="editing.TimeoutSec" type="number" min="1" max="600" />
+        <label>Canary Group</label>    <input v-model="editing.CanaryGroup" placeholder="default / gray-2024q3 / ..." />
+        <label>协议段</label>
+        <div>
+          <div v-if="editing.Protocol === 'openai'" style="display:grid; gap:8px;">
+            <input v-model="editing.OpenAI.StreamPath" placeholder="流式路径，默认 /v1/chat/completions" />
+            <textarea v-model="editing.OpenAI.ExtraHeadersJSON" placeholder='自定义 header（JSON）例如 {"X-Canary":"gray"}'></textarea>
+          </div>
+          <div v-if="editing.Protocol === 'anthropic'" style="display:grid; gap:8px;">
+            <input v-model.number="editing.Anthropic.MaxTokens" type="number" placeholder="max_tokens（默认 1024）" />
+            <textarea v-model="editing.Anthropic.ExtraHeadersJSON" placeholder='自定义 header（JSON）'></textarea>
+          </div>
+          <div v-if="editing.Protocol === 'gemini'" style="display:grid; gap:8px;">
+            <select v-model="editing.Gemini.Alt">
+              <option value="sse">sse</option>
+              <option value="ndjson">ndjson</option>
+            </select>
+            <textarea v-model="editing.Gemini.ExtraHeadersJSON" placeholder='自定义 header（JSON）'></textarea>
+          </div>
+        </div>
+        <label>通知</label>
+        <div>
+          <label style="display:inline-flex; align-items:center; gap:6px;">
+            <input type="checkbox" v-model="editing.Notify.Enabled" /> 启用企业微信通知
+          </label>
+          <input v-model="editing.Notify.WeComWebhookPlain" placeholder="wecom webhook URL（保存时加密入库）" style="margin-top:6px;" />
+        </div>
+      </div>
+      <div style="margin-top:24px; display:flex; gap:8px; justify-content:flex-end;">
+        <button @click="editing=null">取消</button>
+        <button v-if="editing.ID" class="danger" @click="del(editing); editing=null">删除</button>
+        <button class="primary" @click="saveTask" :disabled="!canSave">{{ editing.ID ? '保存' : '创建' }}</button>
+      </div>
+    </div>
+  </div>
+
+  <div :class="['toast', toast.kind, { show: !!toast.msg }]">{{ toast.msg }}</div>
+</div>
+
+<script>
+const { createApp, reactive, ref, computed, onMounted } = Vue;
+
+createApp({
+  setup() {
+    const apiBase = ref("");        // 留空：与 HTML 同源；填 http://host:9090 即跨域
+    const tasks   = ref([]);
+    const loading = ref(false);
+    const reloading = ref(false);
+    const filter  = ref("");
+    const protocolFilter = ref("");
+    const editing = ref(null);
+    const toast   = reactive({ msg: "", kind: "" });
+
+    const canCreate = computed(() => false);  // 待后端补 POST /admin/tasks
+    const canDelete = computed(() => false);  // 待后端补 DELETE /admin/tasks
+    const canSave   = computed(() => false);  // 同上
+    const filtered  = computed(() => tasks.value.filter(t => {
+      const f = filter.value.toLowerCase();
+      const p = !protocolFilter.value || t.Protocol === protocolFilter.value;
+      return p && (!f || (t.Name||"").toLowerCase().includes(f)
+                 || (t.Protocol||"").toLowerCase().includes(f)
+                 || (t.Model||"").toLowerCase().includes(f));
+    }));
+
+    async function loadTasks() {
+      loading.value = true;
+      try {
+        const r = await fetch(apiBase.value + "/admin/tasks");
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        const data = await r.json();
+        tasks.value = data.tasks || [];
+        ok("已加载 " + tasks.value.length + " 个任务");
+      } catch (e) {
+        err("加载失败：" + e.message);
+      } finally {
+        loading.value = false;
+      }
+    }
+
+    async function reload() {
+      reloading.value = true;
+      try {
+        const r = await fetch(apiBase.value + "/admin/reload", { method: "POST" });
+        if (!r.ok) throw new Error("HTTP " + r.status);
+        ok("热重载完成");
+        setTimeout(loadTasks, 300);
+      } catch (e) {
+        err("重载失败：" + e.message);
+      } finally {
+        reloading.value = false;
+      }
+    }
+
+    function openCreate() {
+      editing.value = blank();
+      err("后端尚未实现 POST /admin/tasks。请先在 SQLite/CLI 写入后刷新。");
+    }
+
+    function openEdit(t) {
+      // 只读展示（但 UI 是 reactive 表单，可以复制值出来看）
+      editing.value = {
+        ...t,
+        ID: t.ID, Name: t.Name,
+        Protocol: t.Protocol,
+        BaseURL: t.BaseURL,
+        APIKeyPlain: "(已加密存盘，不可回显)",
+        Model: t.Model,
+        SystemPrompt: t.SystemPrompt || "",
+        UserPrompt: t.UserPrompt,
+        Schedule: t.Schedule,
+        TimeoutSec: (t.TimeoutMS || 30000) / 1000,
+        CanaryGroup: t.CanaryGroup || "default",
+        OpenAI: t.OpenAI || {},
+        Anthropic: t.Anthropic || {},
+        Gemini: t.Gemini || {},
+        Notify: {
+          Enabled: (t.Notify && t.Notify.Enabled) || false,
+          WeComWebhookPlain: t.Notify && t.Notify.WeComWebhook ? "(已加密存盘)" : ""
+        }
+      };
+    }
+
+    async function del(t) {
+      if (!confirm("确认删除任务 " + t.Name + "？")) return;
+      err("后端尚未实现 DELETE /admin/tasks/:id。请用 sqlite3 手动删除。");
+    }
+
+    async function saveTask() {
+      err("后端尚未实现 POST/PATCH /admin/tasks。请用 sqlite3 手动写入。");
+    }
+
+    function blank() {
+      return {
+        ID: "", Name: "", Protocol: "openai",
+        BaseURL: "", APIKeyPlain: "", Model: "gpt-4o",
+        SystemPrompt: "", UserPrompt: "Say hi at {{.Now.Date}}",
+        Schedule: "*/30 * * * * *", TimeoutSec: 30,
+        CanaryGroup: "default",
+        OpenAI: { StreamPath: "", ExtraHeadersJSON: "" },
+        Anthropic: { MaxTokens: 1024, ExtraHeadersJSON: "" },
+        Gemini: { Alt: "sse", ExtraHeadersJSON: "" },
+        Notify: { Enabled: false, WeComWebhookPlain: "" }
+      };
+    }
+
+    function ok(m) { toast.kind = "ok"; toast.msg = m; setTimeout(() => toast.msg = "", 2400); }
+    function err(m) { toast.kind = "err"; toast.msg = m; setTimeout(() => toast.msg = "", 3200); }
+
+    onMounted(() => {
+      // 自动检测：API 与页面同源时省略跨域前缀；不同源可手工填 apiBase
+      apiBase.value = window.location.origin || "";
+      loadTasks();
+      // 每 30s 自动刷新
+      setInterval(loadTasks, 30000);
+    });
+
+    return { apiBase, tasks, loading, reloading, filter, protocolFilter,
+             editing, toast, filtered,
+             canCreate, canDelete, canSave,
+             loadTasks, reload, openCreate, openEdit, del, saveTask };
+  }
+}).mount("#app");
+</script>
+</body>
+</html>

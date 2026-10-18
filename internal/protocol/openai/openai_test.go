@@ -11,8 +11,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aibench/aibench/ai-monitor/internal/config"
-	"github.com/aibench/aibench/ai-monitor/internal/protocol"
+	"github.com/angryang/ai-monitor/internal/config"
+	"github.com/angryang/ai-monitor/internal/protocol"
 )
 
 var _ = strings.Contains // keep import used
@@ -255,5 +255,59 @@ func TestExtraHeaders_BlackList(t *testing.T) {
 		if !errors.Is(err, protocol.ErrBlacklistHeader) {
 			t.Fatalf("%s: got %v", header, err)
 		}
+	}
+}
+
+// TestOpenAI_Probe_GeneratesReqID verifies that ai-monitor auto-injects a
+// canonical X-Req-Id per probe so upstream logs are correlatable.
+func TestOpenAI_Probe_GeneratesReqID(t *testing.T) {
+	var captured string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured = r.Header.Get("X-Req-Id")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+	adapter := newAdapter(t)
+	cfg := baseTask()
+	cfg.BaseURL = srv.URL
+	s, err := adapter.Probe(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	for range s.Chunks() {
+	}
+	if captured == "" {
+		t.Fatalf("X-Req-Id missing from upstream request")
+	}
+	// Default generator is uuid.NewString → expect 36-char id with 4 hyphens.
+	if len(captured) != 36 || strings.Count(captured, "-") != 4 {
+		t.Fatalf("X-Req-Id %q does not look like a uuid", captured)
+	}
+}
+
+// TestOpenAI_Probe_UserReqIDFromExtras asserts the user-supplied id wins
+// when provided via extra_headers (consistent with §11 design intent:
+// adapters only supply a default when the user hasn't picked one).
+func TestOpenAI_Probe_UserReqIDFromExtras(t *testing.T) {
+	var captured string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured = r.Header.Get("X-Req-Id")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, "data: [DONE]\n\n")
+	}))
+	defer srv.Close()
+	adapter := newAdapter(t)
+	cfg := baseTask()
+	cfg.BaseURL = srv.URL
+	cfg.OpenAI = &config.OpenAIConfig{ExtraHeadersJSON: `{"X-Req-Id":"upstream-trace-42"}`}
+	s, err := adapter.Probe(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	for range s.Chunks() {
+	}
+	if captured != "upstream-trace-42" {
+		t.Fatalf("X-Req-Id: got %q, want %q", captured, "upstream-trace-42")
 	}
 }

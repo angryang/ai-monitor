@@ -1,0 +1,93 @@
+# ai-monitor · project .gitignore
+# -----------------------------------------------------------------------------
+# Generated 2026-10-18 after directory flatten (aibench/ai-monitor/ → aibench/).
+# Adjust together with README + docs/design.md if the project layout changes.
+# -----------------------------------------------------------------------------
+
+# ----------------------------------------------------------------------
+# Build artifacts (project-specific)
+# ----------------------------------------------------------------------
+# Main binary; every `go build -o ai-monitor` rewrites it.
+/ai-monitor
+# Historical binary snapshots (e.g. ai-monitor.old2 from a workbuddy rollback).
+/ai-monitor.old*
+
+# SQLite runtime database (rewritten on every ai-monitor start).
+*.db
+*.db-shm
+*.db-wal
+
+# Go embed source: synced from web/dist by `make web-build`, then baked into
+# the binary via //go:embed. Must NEVER be committed; rebuild generates it.
+internal/webui/dist/
+
+# Local web build staging area (mirrors internal/webui/dist during build).
+internal/webui/assets-staging/
+
+# ----------------------------------------------------------------------
+# Go toolchain
+# ----------------------------------------------------------------------
+*.test
+*.out
+coverage.out
+coverage.html
+*.prof
+*.pprof
+*.exe
+*.dll
+*.so
+*.dylib
+go.work
+go.work.sum
+vendor/
+
+# ----------------------------------------------------------------------
+# Frontend
+# ----------------------------------------------------------------------
+# web/ has its own .gitignore (node_modules / dist / .vite / *.local) — the
+# root file only adds the embed mirror handled above.
+
+# ----------------------------------------------------------------------
+# IDE / Editor
+# ----------------------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+*.bak
+*.orig
+*.tmp
+*.log
+
+# ----------------------------------------------------------------------
+# OS
+# ----------------------------------------------------------------------
+.DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+.Trash-*
+.fuse_hidden*
+$RECYCLE.BIN/
+
+# ----------------------------------------------------------------------
+# Workbuddy workspace data (chat history, memory, scratch files)
+# ----------------------------------------------------------------------
+.workbuddy/
+
+# ----------------------------------------------------------------------
+# Local secrets (avoid accidental commit)
+# ----------------------------------------------------------------------
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# ----------------------------------------------------------------------
+# Backup / archive produced by tooling
+# ----------------------------------------------------------------------
+*.tar.gz
+*.zip
+*.tgz

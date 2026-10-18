@@ -1,0 +1,283 @@
+{
+  "common": {
+    "cancel": "Cancel",
+    "save": "Save",
+    "create": "Create",
+    "update": "Update",
+    "delete": "Delete",
+    "edit": "Edit",
+    "open": "Open",
+    "back": "Back to dashboard",
+    "loading": "loading…",
+    "close": "close",
+    "dismiss": "dismiss",
+    "enabled": "enabled",
+    "disabled": "disabled",
+    "paused": "paused",
+    "yes": "yes",
+    "no": "no",
+    "unknownError": "unknown error"
+  },
+  "nav": {
+    "tasks": "Tasks",
+    "metrics": "Metrics",
+    "users": "Users",
+    "profile": "Profile",
+    "controlPlane": "control plane",
+    "brand": "ai-monitor"
+  },
+  "lang": {
+    "zh": "中文",
+    "en": "English",
+    "switchLabel": "Language"
+  },
+  "theme": {
+    "toggle": "Theme",
+    "toDark": "Switch to dark",
+    "toLight": "Switch to light"
+  },
+  "auth": {
+    "roleAdmin": "admin",
+    "roleViewer": "viewer",
+    "logout": "logout",
+    "title": "control plane",
+    "subtitle": "login to manage probes + users",
+    "username": "Username",
+    "password": "Password",
+    "signIn": "Sign in",
+    "hint": "env-driven credentials · JWT HS256 · 12h token TTL"
+  },
+  "crumb": {
+    "tasks": "Tasks",
+    "tasksNew": "Tasks · New",
+    "tasksEdit": "Tasks · Edit",
+    "tasksDetail": "Tasks · Detail",
+    "tasksRuns": "Tasks · Run history",
+    "metrics": "Metrics",
+    "users": "Users",
+    "profile": "Profile",
+    "fallback": "ai-monitor"
+  },
+  "runs": {
+    "reload": "reload",
+    "timeline": {
+      "title": "Run trend",
+      "subtitle": "last {n} probes (oldest → newest)",
+      "total": "total",
+      "success": "success",
+      "failures": "failures",
+      "p95": "P95",
+      "chartOld": "old",
+      "chartNew": "new",
+      "peak": "peak"
+    },
+    "status": {
+      "success": "success",
+      "failure": "failure",
+      "unauthorized": "unauthorized"
+    },
+    "row": {
+      "duration": "duration",
+      "itl": "ITL",
+      "chunks": "chunks",
+      "errPrefix": "ERR",
+      "errNone": "no error",
+      "copyErr": "copy full error",
+      "wire": {
+        "title": "Wire capture",
+        "request": "request body",
+        "responseHead": "response head",
+        "responseTail": "response tail",
+        "requestId": "X-Req-Id",
+        "truncated": "… truncated",
+        "requestTruncatedNote": "request body exceeded 32 KiB and was truncated",
+        "responseTruncatedNote": "middle bytes were dropped (head + tail 4 KiB each kept)",
+        "missing": "—",
+        "copyReq": "copy full request body",
+        "copyRespHead": "copy response head",
+        "copyRespTail": "copy response tail",
+        "show": "view request / response"
+      }
+    },
+    "list": {
+      "title": "Per-run log",
+      "limit": "limit",
+      "emptyTitle": "no runs yet",
+      "emptyDesc": "new tasks get their first row only after the next cron tick."
+    }
+  },
+  "task": {
+    "list": {
+      "title": "Tasks",
+      "subtitle": "live probe configurations; hover a row for full payload",
+      "new": "New task",
+      "emptyTitle": "No tasks yet",
+      "emptyDesc": "Create one to start probing your AI endpoints."
+    },
+    "col": {
+      "name": "name",
+      "protocol": "protocol",
+      "model": "model",
+      "schedule": "schedule",
+      "status": "status",
+      "updated": "updated"
+    },
+    "detail": {
+      "id": "id",
+      "baseUrl": "base_url",
+      "userPrompt": "user_prompt",
+      "canaryGroup": "canary_group",
+      "apiKey": "api_key",
+      "webhook": "notify.webhook",
+      "configured": "configured (encrypted)",
+      "notSet": "—",
+      "open": "Open",
+      "edit": "Edit",
+      "delete": "Delete",
+      "runs": "run history",
+      "identity": "Identity",
+      "schedule": "Schedule",
+      "prompts": "Prompts",
+      "protocol": "protocol",
+      "model": "model",
+      "canary": "canary",
+      "enabled": "enabled",
+      "cron": "cron",
+      "timeout": "timeout",
+      "systemLabel": "system:",
+      "userLabel": "user:",
+      "vars": "vars: {json}",
+      "deleteConfirmTitle": "Delete task?",
+      "deleteConfirmBody": "Removing {name} stops probing immediately.",
+      "start": "Start",
+      "stop": "Stop",
+      "startConfirmTitle": "Start task?",
+      "startConfirmBody": "{name} will fire on the next cron tick.",
+      "stopConfirmTitle": "Stop task?",
+      "stopConfirmBody": "Cron will no longer fire {name}.",
+      "statusStopped": "stopped",
+      "statusRunning": "running"
+    },
+    "form": {
+      "editTitle": "Edit task",
+      "newTitle": "New task",
+      "note": "api keys + webhooks are encrypted server-side and never echoed in responses",
+      "name": "Name",
+      "protocol": "Protocol",
+      "baseUrl": "Base URL",
+      "apiKey": "API key",
+      "apiKeyKeep": "API key (leave empty to keep)",
+      "model": "Model",
+      "schedule": "Schedule",
+      "scheduleHint": "5–7 field cron",
+      "timeout": "Timeout",
+      "timeoutHint": "e.g. 30s",
+      "canary": "Canary group",
+      "userPrompt": "User prompt",
+      "systemPrompt": "System prompt",
+      "notification": "Notification",
+      "notifyEnabled": "enabled",
+      "wecom": "WeCom webhook",
+      "wecomHint": "leave empty to keep existing",
+      "submitCreate": "Create",
+      "submitSave": "Save",
+      "cancel": "Cancel"
+    }
+  },
+  "user": {
+    "list": {
+      "title": "Users",
+      "subtitle": "manage admin and viewer accounts",
+      "new": "New user"
+    },
+    "col": {
+      "username": "username",
+      "display": "display",
+      "role": "role",
+      "status": "status",
+      "created": "created"
+    },
+    "create": {
+      "title": "Create user",
+      "username": "Username",
+      "display": "Display name",
+      "password": "Password",
+      "role": "Role",
+      "submit": "Create",
+      "cancel": "Cancel"
+    },
+    "delete": {
+      "title": "Delete user?",
+      "body": "Removing {name} revokes their access immediately."
+    },
+    "drawer": {
+      "id": "id",
+      "username": "username",
+      "display": "display_name",
+      "role": "role",
+      "enabled": "enabled",
+      "createdAt": "created_at",
+      "updatedAt": "updated_at"
+    }
+  },
+  "profile": {
+    "title": "Profile",
+    "subtitle": "rotate your password or check your session",
+    "identity": "Identity",
+    "username": "username",
+    "displayName": "display_name",
+    "role": "role",
+    "sessionExpires": "session expires",
+    "changePwd": "Change password",
+    "currentPwd": "Current password",
+    "newPwd": "New password",
+    "newPwdHint": "at least 12 characters",
+    "update": "Update"
+  },
+  "metrics": {
+    "title": "Metrics",
+    "placeholder": "TTFT / ITL / duration P50/P90/P95/P99 — wired in T05."
+  },
+  "notFound": {
+    "title": "404",
+    "desc": "no such page in this control plane",
+    "action": "Back to dashboard"
+  },
+  "forbidden": {
+    "title": "403 · forbidden",
+    "desc": "your role does not allow access to {path}",
+    "fallbackPath": "this page",
+    "action": "Back to dashboard"
+  },
+  "toast": {
+    "successLogin": "logged in",
+    "welcomeBack": "welcome back, {name}",
+    "taskCreated": "task created",
+    "taskUpdated": "task updated",
+    "taskDeleted": "task deleted",
+    "taskStarted": "task started",
+    "taskStopped": "task stopped",
+    "userCreated": "user created",
+    "userDeleted": "user deleted",
+    "pwdChanged": "password changed",
+    "pwdChangedHint": "please log in again next session",
+    "errLogin": "login failed",
+    "errLoad": "load failed",
+    "errUpdate": "update failed",
+    "errCreate": "create failed",
+    "errDelete": "delete failed",
+    "errStart": "start failed",
+    "errStop": "stop failed",
+    "errChange": "change failed"
+  },
+  "validation": {
+    "required": "required",
+    "requiredField": "{label} required",
+    "minLength": "must be at least {n} characters",
+    "minLengthShort": "at least {n} characters",
+    "url": "must be a URL",
+    "urlProtocol": "must start with http:// or https://",
+    "cron": "cron must have 5–7 fields",
+    "invalidRole": "invalid role"
+  }
+}

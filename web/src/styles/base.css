@@ -1,0 +1,125 @@
+@import "./tokens.css";
+@import "./animations.css";
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+}
+
+html {
+  font-family: var(--font-body);
+  font-size: var(--fs-14);
+  line-height: var(--lh-base);
+  color: var(--text);
+  background: var(--bg);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+body {
+  font-feature-settings: "ss01", "cv11";
+  letter-spacing: 0.01em;
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+  border-bottom: 1px solid transparent;
+  transition: border-color var(--dur-fast) var(--ease-out);
+}
+
+a:hover {
+  border-bottom-color: var(--accent);
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+code,
+pre,
+.mono {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0;
+}
+
+hr {
+  border: 0;
+  border-top: 1px solid var(--border);
+  margin: var(--space-5) 0;
+}
+
+::selection {
+  background: var(--accent-soft);
+  color: var(--text);
+}
+
+/* Scrollbar — slim and on-brand. */
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-thumb {
+  background: var(--surface-3);
+  border-radius: var(--radius-pill);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--muted-2);
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+/* Focus ring */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/* Headings */
+h1,
+h2,
+h3,
+h4 {
+  font-family: var(--font-display);
+  font-weight: var(--fw-semibold);
+  margin: 0 0 var(--space-3) 0;
+  color: var(--text);
+  letter-spacing: -0.01em;
+}
+
+h1 { font-size: var(--fs-32); line-height: var(--lh-tight); }
+h2 { font-size: var(--fs-24); line-height: var(--lh-tight); }
+h3 { font-size: var(--fs-20); }
+h4 { font-size: var(--fs-16); }
+
+small,
+.text-muted {
+  color: var(--muted);
+  font-size: var(--fs-12);
+}
+
+.text-mono { font-family: var(--font-mono); }
+.text-display { font-family: var(--font-display); font-variant-numeric: tabular-nums; }
+.text-metric { font-family: var(--font-display); font-variant-numeric: tabular-nums; font-weight: var(--fw-semibold); }
+.text-accent { color: var(--accent); }
+.text-ok { color: var(--ok); }
+.text-warn { color: var(--warn); }
+.text-danger { color: var(--danger); }

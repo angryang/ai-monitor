@@ -5,9 +5,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aibench/aibench/ai-monitor/internal/config"
-	"github.com/aibench/aibench/ai-monitor/internal/metrics"
-	"github.com/aibench/aibench/ai-monitor/internal/protocol"
+	"github.com/angryang/ai-monitor/internal/config"
+	"github.com/angryang/ai-monitor/internal/metrics"
+	"github.com/angryang/ai-monitor/internal/protocol"
 )
 
 func TestRunner_ProtocolMutuallyExclusive(t *testing.T) {

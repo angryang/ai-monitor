@@ -32,19 +32,34 @@ Built per `docs/design.md` (kept in this repo).
 ## Quick start
 
 ```bash
-# 1. Build
+# 一键启动（最简；自动生成 master + jwt；输出登录信息）
+./scripts/run-local.sh             # 前台；Ctrl+C 退出
+./scripts/run-local.sh --bg        # 后台，日志 /tmp/ai-monitor.log
+./scripts/run-local.sh --clean     # 启动前清空 DB（首次启动用）
+
+# 浏览器：
+#   URL     : http://localhost:9090
+#   默认账号 : admin / LocalAdmin2026!Q
+#   启动日志会一行 INFO: "seed_admin_created"（DB 已有 admin 时是 "seed_admin_exists"）
+
+# 或者手动（更细的控制）：
 make build
-
-# 2. Provide a master key (32 bytes) and start
 export AI_MONITOR_MASTER_KEY=$(openssl rand -hex 16)
-./ai-monitor --config deploy/example.config.yaml
-
-# 3. Send traffic & scrape
-curl http://localhost:9090/healthz
-curl http://localhost:9090/metrics   # Prometheus pull target
-curl http://localhost:9090/admin/tasks
-curl -X POST http://localhost:9090/admin/reload
+export AI_MONITOR_JWT_SECRET=$(openssl rand -hex 16)
+export AI_MONITOR_ADMIN_PASSWORD="LocalAdmin2026!Q"
+export WECOM_WEBHOOK="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test"
+./ai-monitor -config deploy/example.config.yaml
 ```
+
+服务可用后：
+
+```bash
+curl http://localhost:9090/healthz                       # 健康检查
+curl http://localhost:9090/metrics                       # Prometheus 拉取目标
+curl http://localhost:9090/admin/tasks -H "auth:..."     # 任务列表（需 token）
+```
+
+`POST /auth/login` 拿 admin token 后即可调所有 `/admin/*` 写接口。详细 RBAC 矩阵见 `docs/design.md` §18.8。
 
 ## Configuration
 

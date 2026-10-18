@@ -70,6 +70,15 @@ func (s *SqliteStore) SetCipher(c Cipher) {
 	s.cipher = c
 }
 
+// DB returns the underlying *gorm.DB. It exists so peer stores (e.g. the
+// probe run history store) can share the same SQLite file handle / WAL
+// without re-opening it. Callers should treat the returned handle as
+// read-only; writes should still go through the appropriate Store method
+// so encryption / watch / poll bookkeeping stays correct.
+func (s *SqliteStore) DB() *gorm.DB {
+	return s.db
+}
+
 // cipherOrNil returns the configured cipher under a read-lock.
 func (s *SqliteStore) cipherOrNil() Cipher {
 	s.mu.RLock()

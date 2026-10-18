@@ -12,9 +12,11 @@ package protocol
 import (
 	"context"
 	"errors"
+	"net/http"
 	"time"
 
-	"github.com/aibench/aibench/ai-monitor/internal/config"
+	"github.com/angryang/ai-monitor/internal/config"
+	"github.com/google/uuid"
 )
 
 // Chunk is a single streaming fragment reported by the upstream API.
@@ -36,6 +38,20 @@ type ProbeStream interface {
 	Err() error
 	// Close releases the underlying HTTP connection. Idempotent.
 	Close() error
+	// RequestID returns the X-Req-Id value used on the outbound HTTP
+	// request. Empty when the protocol never set the header (shouldn't
+	// happen for OpenAI / Anthropic / Gemini, all of which auto-inject).
+	RequestID() string
+	// RequestBody returns the raw JSON body posted to the upstream API.
+	// May be nil for adapters that build requests lazily; ai-monitor
+	// never logs the body to places where nil could leak — handlers must
+	// guard with len() before stringification.
+	RequestBody() []byte
+	// ResponseSnapshot returns the bounded first N + last M bytes of the
+	// upstream response body, plus a flag indicating whether any bytes in
+	// the middle were dropped. Adapters use RespCapture under the hood;
+	// see respcap.go.
+	ResponseSnapshot() (head []byte, tail []byte, truncated bool)
 }
 
 // ChatProtocolAdapter is implemented by every supported protocol.
@@ -65,4 +81,42 @@ func ClassifyHTTPStatus(code int) error {
 		return ErrProtocolCfg
 	}
 	return nil
+}
+
+// RequestIDHeader is the canonical HTTP header name ai-monitor uses to
+// identify each outbound probe. The value is a string token — by default
+// uuid v4 — that the AI server can echo into its logs so failures map 1:1
+// back to ai-monitor's records.
+//
+// If the user has explicitly set X-Req-Id through OpenAI/Anthropic/Gemini
+// ExtraHeadersJSON, that value wins; we only synthesise a default when the
+// user hasn't picked one. ApplyExtraHeaders runs *after* this so its Set()
+// call overrides our auto-generated value.
+const RequestIDHeader = "X-Req-Id"
+
+// GenerateRequestID ensures req carries RequestIDHeader. The optional
+// generator lets tests inject deterministic ids; production callers pass nil
+// to fall back to uuid.NewString.
+//
+// The returned string is the value that ended up in req.Header so adapters
+// can include it in their slog lines for client-side correlation.
+//
+// Notes:
+//   - Caller must invoke this BEFORE ApplyExtraHeaders so user-supplied
+//     values still win.
+//   - GenerateRequestID never returns empty; if the generator is broken
+//     and returns "", it falls back to uuid.NewString.
+func GenerateRequestID(req *http.Request, generator func() string) string {
+	if existing := req.Header.Get(RequestIDHeader); existing != "" {
+		return existing
+	}
+	rid := ""
+	if generator != nil {
+		rid = generator()
+	}
+	if rid == "" {
+		rid = uuid.NewString()
+	}
+	req.Header.Set(RequestIDHeader, rid)
+	return rid
 }

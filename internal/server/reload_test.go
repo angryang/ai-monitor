@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aibench/aibench/ai-monitor/internal/config"
+	"github.com/angryang/ai-monitor/internal/config"
 )
 
 type fakeLister struct {

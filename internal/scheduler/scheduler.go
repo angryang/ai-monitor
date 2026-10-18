@@ -10,7 +10,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aibench/aibench/ai-monitor/internal/config"
+	"github.com/angryang/ai-monitor/internal/config"
 	"github.com/robfig/cron/v3"
 	"golang.org/x/sync/semaphore"
 )
@@ -107,8 +107,15 @@ func (s *cronScheduler) Stop(ctx context.Context) error {
 	return nil
 }
 
-// Add registers a single task. Panics if the cron expression is invalid.
+// Add registers a single task. Disabled tasks are silently skipped so the
+// scheduler's effective schedule always equals "the subset of tasks whose
+// Enabled flag is true at the moment of call".
 func (s *cronScheduler) Add(task config.TaskConfig) error {
+	if !task.Enabled {
+		// Don't register; if a previous call registered this id, retract it
+		// so reloads of PATCH-enabled=false go straight to "no cron entry".
+		return s.Remove(task.ID)
+	}
 	if _, ok := s.entries[task.ID]; ok {
 		return s.Remove(task.ID)
 	}
@@ -138,8 +145,25 @@ func (s *cronScheduler) Remove(taskID string) error {
 	return nil
 }
 
+// entryIDs returns the task ids currently registered with cron. Test-only —
+// the production Scheduler interface does not expose this. Used to assert
+// "Enabled=false never enters cron" without depending on actual tick firing
+// (which @every 50ms can flake in CI).
+func (s *cronScheduler) entryIDs() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]string, 0, len(s.entries))
+	for k := range s.entries {
+		out = append(out, k)
+	}
+	return out
+}
+
 // Reload replaces the entire task set with the supplied list. Any task
-// removed from the list is unregistered; new ones are added.
+// removed from the list is unregistered; new ones are added. Tasks with
+// Enabled=false are never registered; if such a task was previously
+// scheduled (e.g. flipped from enabled=true to false), its cron entry is
+// removed first.
 func (s *cronScheduler) Reload(ctx context.Context, tasks []config.TaskConfig) error {
 	s.mu.Lock()
 	oldIDs := make([]string, 0, len(s.entries))
@@ -150,6 +174,10 @@ func (s *cronScheduler) Reload(ctx context.Context, tasks []config.TaskConfig) e
 	newIDs := make(map[string]struct{}, len(tasks))
 	for _, t := range tasks {
 		newIDs[t.ID] = struct{}{}
+		// Add() handles the enabled=false case by routing through Remove()
+		// so disabled tasks retract any lingering cron entry, while still
+		// occupying newIDs (so the oldIDs sweep below doesn't issue a
+		// double-remove).
 		if err := s.Add(t); err != nil {
 			return err
 		}

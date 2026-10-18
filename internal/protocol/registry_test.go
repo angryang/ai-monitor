@@ -7,7 +7,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/aibench/aibench/ai-monitor/internal/config"
+	"github.com/angryang/ai-monitor/internal/config"
 )
 
 type stubAdapter struct{ name string }

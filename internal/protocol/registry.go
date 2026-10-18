@@ -13,6 +13,9 @@ import (
 type AdapterDeps struct {
 	HTTPClient *http.Client
 	UserAgent  string
+	// RequestIDGenerator produces a per-probe id used as X-Req-Id. Nil falls
+	// back to uuid.NewString. Tests inject a deterministic closure.
+	RequestIDGenerator func() string
 }
 
 // AdapterFactory returns a freshly-constructed ChatProtocolAdapter.

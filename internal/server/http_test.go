@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/aibench/aibench/ai-monitor/internal/config"
-	"github.com/aibench/aibench/ai-monitor/internal/metrics"
+	"github.com/angryang/ai-monitor/internal/config"
+	"github.com/angryang/ai-monitor/internal/metrics"
 )
 
 // fakeStore implements config.ConfigStore (just ListTasks + Close; the rest

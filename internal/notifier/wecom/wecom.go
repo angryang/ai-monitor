@@ -12,7 +12,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/aibench/aibench/ai-monitor/internal/notifier"
+	"github.com/angryang/ai-monitor/internal/notifier"
 )
 
 // Config is the WeCom backend configuration.

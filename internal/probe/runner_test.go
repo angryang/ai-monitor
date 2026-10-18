@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aibench/aibench/ai-monitor/internal/config"
-	"github.com/aibench/aibench/ai-monitor/internal/metrics"
-	"github.com/aibench/aibench/ai-monitor/internal/notifier"
-	"github.com/aibench/aibench/ai-monitor/internal/protocol"
+	"github.com/angryang/ai-monitor/internal/config"
+	"github.com/angryang/ai-monitor/internal/metrics"
+	"github.com/angryang/ai-monitor/internal/notifier"
+	"github.com/angryang/ai-monitor/internal/protocol"
 )
 
 type stubAdapter struct {
@@ -51,12 +51,22 @@ func (s *stubAdapter) Probe(_ context.Context, c *config.TaskConfig) (protocol.P
 }
 
 type memStream struct {
-	ch chan protocol.Chunk
+	ch        chan protocol.Chunk
+	requestID string
+	reqBody   []byte
+	respHead  []byte
+	respTail  []byte
+	truncated bool
 }
 
 func (m *memStream) Chunks() <-chan protocol.Chunk { return m.ch }
 func (m *memStream) Err() error                    { return nil }
-func (m *memStream) Close() error                 { return nil }
+func (m *memStream) Close() error                  { return nil }
+func (m *memStream) RequestID() string             { return m.requestID }
+func (m *memStream) RequestBody() []byte           { return m.reqBody }
+func (m *memStream) ResponseSnapshot() (head, tail []byte, truncated bool) {
+	return m.respHead, m.respTail, m.truncated
+}
 
 type capturingNotifier struct {
 	mu  sync.Mutex
@@ -77,6 +87,126 @@ func (c *capturingNotifier) Snap() []notifier.AlertEvent {
 	copy(out, c.got)
 	return out
 }
+
+// captureAdapter — stub that injects known capture fields via a custom
+// memStream and verifies the runner plumbs them into the Result.
+type captureAdapter struct {
+	stubAdapter
+	memOverride *memStream
+}
+
+func (c *captureAdapter) Probe(_ context.Context, cfg *config.TaskConfig) (protocol.ProbeStream, error) {
+	c.called.Add(1)
+	if c.cfgHook != nil {
+		c.cfgHook(cfg)
+	}
+	ch := make(chan protocol.Chunk, 1)
+	ch <- c.final
+	close(ch)
+	m := *c.memOverride // copy so each probe gets fresh struct
+	m.ch = ch
+	return &m, nil
+}
+
+func TestRunner_ProbeCapturesWireBytes(t *testing.T) {
+	sink := metrics.NewPromSink(metrics.PrometheusOptions{})
+	captured := &memStream{
+		requestID: "rid-test-001",
+		reqBody:   []byte(`{"model":"x","messages":[{"role":"user","content":"hi"}]}`),
+		respHead:  []byte(`data: {"choices":[{"delta":{"content":"hi"}}]}`),
+		respTail:  []byte(`data: [DONE]`),
+		truncated: false,
+	}
+	adapter := &captureAdapter{
+		stubAdapter: stubAdapter{name: "openai"},
+		memOverride: captured,
+	}
+	runStore := &memRunStore{}
+	r := NewRunner(func(name string) (RunnerAdapter, error) { return adapter, nil }, sink, nil, notifier.NewDeduper(time.Minute))
+	r.Logger = defaultLogForTest()
+	r.RunStore = runStore
+
+	task := config.TaskConfig{ID: "rid", Name: "rid", Protocol: config.ProtocolOpenAI, Enabled: true, BaseURL: "https://e.test", Model: "x", UserPrompt: "hi", Schedule: "@every 1m"}
+	res := r.Run(context.Background(), task)
+
+	if res.RequestID != "rid-test-001" {
+		t.Fatalf("RequestID on Result = %q, want rid-test-001", res.RequestID)
+	}
+	if string(res.RequestBody) != string(captured.reqBody) {
+		t.Fatalf("RequestBody mismatch: got %q, want %q", res.RequestBody, captured.reqBody)
+	}
+	if string(res.ResponseHead) != string(captured.respHead) {
+		t.Fatalf("ResponseHead mismatch: got %q, want %q", res.ResponseHead, captured.respHead)
+	}
+	if string(res.ResponseTail) != string(captured.respTail) {
+		t.Fatalf("ResponseTail mismatch: got %q, want %q", res.ResponseTail, captured.respTail)
+	}
+	if res.ResponseTruncated {
+		t.Fatalf("ResponseTruncated should be false; got true")
+	}
+
+	// Round-trip into ProbeRun + FromResult and verify DB column shape.
+	row := FromResult(res)
+	if row.RequestID != "rid-test-001" {
+		t.Fatalf("FromResult RequestID = %q", row.RequestID)
+	}
+	if row.RequestBody != string(captured.reqBody) {
+		t.Fatalf("FromResult RequestBody = %q", row.RequestBody)
+	}
+	if row.ResponseHead != string(captured.respHead) {
+		t.Fatalf("FromResult ResponseHead = %q", row.ResponseHead)
+	}
+	if row.ResponseTail != string(captured.respTail) {
+		t.Fatalf("FromResult ResponseTail = %q", row.ResponseTail)
+	}
+}
+
+func TestRunner_ProbeCaptureMarksTruncation(t *testing.T) {
+	// When the adapter reports ResponseTruncated=true the runner should
+	// surface it on the Result AND on the persisted ProbeRun.
+	captured := &memStream{
+		respHead:  []byte("a"),
+		respTail:  []byte("z"),
+		truncated: true,
+	}
+	sink := metrics.NewPromSink(metrics.PrometheusOptions{})
+	adapter := &captureAdapter{
+		stubAdapter: stubAdapter{name: "openai"},
+		memOverride: captured,
+	}
+	runStore := &memRunStore{}
+	r := NewRunner(func(name string) (RunnerAdapter, error) { return adapter, nil }, sink, nil, notifier.NewDeduper(time.Minute))
+	r.Logger = defaultLogForTest()
+	r.RunStore = runStore
+
+	task := config.TaskConfig{ID: "t", Name: "t", Protocol: config.ProtocolOpenAI, Enabled: true, BaseURL: "https://e.test", Model: "x", UserPrompt: "hi", Schedule: "@every 1m"}
+	res := r.Run(context.Background(), task)
+	if !res.ResponseTruncated {
+		t.Fatalf("ResponseTruncated should be true; got false")
+	}
+	if !FromResult(res).ResponseTruncated {
+		t.Fatalf("ProbeRun.ResponseTruncated should be true; got false")
+	}
+}
+
+// memRunStore is a tiny in-memory RunStore for the capture tests; the
+// runner only writes through it.
+type memRunStore struct {
+	mu   sync.Mutex
+	runs []ProbeRun
+}
+
+func (m *memRunStore) Save(_ context.Context, run *ProbeRun) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.runs = append(m.runs, *run)
+	return nil
+}
+func (m *memRunStore) ListByTask(_ context.Context, _ string, _ int) ([]ProbeRun, error) {
+	return nil, nil
+}
+func (m *memRunStore) Prune(_ context.Context, _ int) error { return nil }
+func (m *memRunStore) Close() error                       { return nil }
 
 func newRunnerForTest(a RunnerAdapter, sink metrics.MetricSink, n notifier.Notifier) *Runner {
 	r := NewRunner(func(name string) (RunnerAdapter, error) {

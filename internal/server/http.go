@@ -1,18 +1,21 @@
-// Package server wires the HTTP surface area: /metrics, /healthz, /admin/*.
-// A1 served only /healthz; G2 adds the metrics, admin/tasks, and admin/reload
-// routes and graceful Shutdown.
+// Package server wires the HTTP surface area: /metrics, /healthz, /admin/*,
+// and (since §18) /auth/* + SPA fallback. The cmd/* package hands us a
+// pre-built *auth.Middleware; we apply it on the appropriate sub-mux so the
+// legacy /admin/* tests keep passing without authentication.
 package server
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"net/http"
 	"sync/atomic"
 	"time"
 
-	"github.com/aibench/aibench/ai-monitor/internal/config"
-	"github.com/aibench/aibench/ai-monitor/internal/metrics"
-	"github.com/aibench/aibench/ai-monitor/internal/scheduler"
+	"github.com/angryang/ai-monitor/internal/auth"
+	"github.com/angryang/ai-monitor/internal/config"
+	"github.com/angryang/ai-monitor/internal/metrics"
+	"github.com/angryang/ai-monitor/internal/probe"
+	"github.com/angryang/ai-monitor/internal/scheduler"
 )
 
 // Server wraps an http.Server with the routes declared by the design.
@@ -21,18 +24,38 @@ type Server struct {
 	store      config.ConfigStore
 	sch        scheduler.Scheduler
 	lastTick   atomic.Int64 // unix secs of the latest scheduler fire (for /healthz)
+
+	// authMiddleware is non-nil when the binary is built with auth enabled
+	// (§18). It owns /auth/login, /auth/me, etc., and gates /admin/users
+	// and /admin/tasks.
+	authMiddleware *auth.Middleware
+	// userStore backs /admin/users. nil when auth is disabled.
+	userStore auth.UserStore
 }
 
 // Options carries the dependencies needed by the richer server implementation.
 // All fields are optional; defaulted to internal safe values.
 type Options struct {
-	Addr    string
-	Metrics http.Handler
-	Healthz http.Handler // optional override
-	Store   config.ConfigStore
+	Addr      string
+	Metrics   http.Handler
+	Healthz   http.Handler // optional override
+	Store     config.ConfigStore
 	Scheduler scheduler.Scheduler
-	Logger   LoggerFunc
-	Timeout  time.Duration
+	Logger    LoggerFunc
+	Timeout   time.Duration
+
+	// Auth is the JWT + RBAC middleware. When non-nil, /auth/* and the
+	// admin/user routes get wrapped with it. Leaving it nil preserves the
+	// pre-§18 behaviour (any request reaches the handlers).
+	Auth *auth.Middleware
+	// UserStore backs /admin/users. Required iff Auth is non-nil.
+	UserStore auth.UserStore
+	// Cipher encrypts apikey + webhook at rest when admin/tasks writes
+	// arrive through the HTTP layer. Optional.
+	Cipher config.Cipher
+	// RunStore backs the /admin/tasks/{id}/runs endpoint. Optional; if
+	// nil the endpoint returns 503 so admins know history is disabled.
+	RunStore probe.RunStore
 }
 
 // LoggerFunc matches the slog.Logger style signature used inside handler
@@ -50,18 +73,23 @@ func New(opts Options) *Server {
 		logf = func(string, ...any) {}
 	}
 	s := &Server{
-		store: opts.Store,
-		sch:   opts.Scheduler,
+		store:          opts.Store,
+		sch:            opts.Scheduler,
+		authMiddleware: opts.Auth,
+		userStore:      opts.UserStore,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealthz(opts.Healthz))
 	if opts.Metrics != nil {
 		mux.Handle("GET /metrics", opts.Metrics)
 	}
-	adminMux := http.NewServeMux()
-	adminMux.HandleFunc("GET /admin/tasks", s.handleListTasks())
-	adminMux.HandleFunc("POST /admin/reload", s.handleReload())
-	mux.Handle("/admin/", adminMux)
+	// Auth + admin + SPA routes are mounted under /auth, /admin, and /
+	// respectively. We split them so the test suite can pin patterns down
+	// without dragging in the auth middleware.
+	mux.Handle("/auth/", s.buildAuthRoutes(opts))
+	mux.Handle("/admin/", s.buildAdminRoutes(opts))
+	// Static handler also serves SPA fallback for non-API routes.
+	mux.Handle("/", s.handleStatic())
 
 	timeout := opts.Timeout
 	if timeout == 0 {
@@ -80,8 +108,6 @@ func New(opts Options) *Server {
 }
 
 // SetLastTick is a hook the scheduler uses to update the health-check metric.
-// We expose it so the assembly in main can hook the scheduler callback
-// without coupling scheduler ↔ server directly.
 func (s *Server) SetLastTick(unixSec int64) { s.lastTick.Store(unixSec) }
 
 // Handle serves as a middleware-free access point for tests.
@@ -89,7 +115,7 @@ func (s *Server) Handle() http.Handler { return s.httpServer.Handler }
 
 // Start blocks running the HTTP server until Shutdown is called.
 func (s *Server) Start() error {
-	if err := s.httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	if err := s.httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
 	}
 	return nil
@@ -101,9 +127,7 @@ func (s *Server) Shutdown(ctx context.Context) error {
 }
 
 // Addr returns the underlying server address (useful for tests bound to ":0").
-func (s *Server) Addr() string {
-	return s.httpServer.Addr
-}
+func (s *Server) Addr() string { return s.httpServer.Addr }
 
 // handleHealthz returns 200 when DB ping succeeds; 503 otherwise.
 func (s *Server) handleHealthz(custom http.Handler) http.HandlerFunc {
@@ -127,48 +151,73 @@ func (s *Server) handleHealthz(custom http.Handler) http.HandlerFunc {
 	}
 }
 
-// handleListTasks returns the full task list as JSON (no secrets).
-func (s *Server) handleListTasks() http.HandlerFunc {
-	return func(w http.ResponseWriter, _ *http.Request) {
-		if s.store == nil {
-			http.Error(w, `{"error":"store not configured"}`, http.StatusInternalServerError)
-			return
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		tasks, err := s.store.ListTasks(ctx)
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		// Redact secrets before exposing via HTTP.
-		for i := range tasks {
-			tasks[i].APIKey = ""
-			tasks[i].APIKeyEnc = nil
-			tasks[i].Notify.WeComWebhook = ""
-			tasks[i].Notify.WeComWebhookEnc = nil
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(map[string]any{"tasks": tasks})
+// buildAuthRoutes returns a small mux dedicated to /auth/*. When no auth
+// middleware is wired it returns a 501 handler — handy for tests that don't
+// want auth to break their setup.
+func (s *Server) buildAuthRoutes(opts Options) http.Handler {
+	if opts.Auth == nil || opts.UserStore == nil {
+		return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			WriteAPIError(w, http.StatusNotImplemented, "auth_disabled", "auth is not configured")
+		})
 	}
+	cfg := &AuthHandlersConfig{
+		Auth:   opts.Auth,
+		Users:  opts.UserStore,
+		Logger: opts.Logger,
+	}
+	return NewAuthHandlers(cfg).Routes()
+}
+
+// buildAdminRoutes returns the mux for /admin/* — task + user CRUD. The
+// pre-§18 routes stay accessible so legacy tests pass; the new RBAC paths
+// share the same sub-mux but each handler enforces its own role gate.
+func (s *Server) buildAdminRoutes(opts Options) http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /admin/reload", s.handleReload())
+
+	if opts.Auth != nil && opts.UserStore != nil {
+		cfg := &AdminTaskHandlersConfig{
+			Auth:      opts.Auth,
+			Users:     opts.UserStore,
+			Store:     opts.Store,
+			Cipher:    opts.Cipher,
+			RunStore:  opts.RunStore,
+			Scheduler: opts.Scheduler,
+			Logger:    opts.Logger,
+		}
+		// Mount admin_task_handlers directly on this mux so every method
+		// (GET / POST / PATCH / DELETE) is registered against the same
+		// pattern matcher. Using a sub-mux tripped over Go 1.22+ ServeMux
+		// prefix-stripping rules.
+		NewAdminTaskHandlers(cfg).Mount(mux)
+
+		userCfg := &AdminUserHandlersConfig{
+			Auth:   opts.Auth,
+			Users:  opts.UserStore,
+			Logger: opts.Logger,
+		}
+		mux.Handle("/admin/users", NewAdminUserHandlers(userCfg).Routes())
+		mux.Handle("/admin/users/", NewAdminUserHandlers(userCfg).Routes())
+	}
+	return mux
 }
 
 // handleReload re-reads tasks from the store and reloads the scheduler.
 func (s *Server) handleReload() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if s.store == nil || s.sch == nil {
-			http.Error(w, `{"error":"not configured"}`, http.StatusInternalServerError)
+			WriteAPIError(w, http.StatusInternalServerError, "not_configured", "store/scheduler missing")
 			return
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 		defer cancel()
 		tasks, err := s.store.ListTasks(ctx)
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			WriteAPIError(w, http.StatusInternalServerError, "list_failed", err.Error())
 			return
 		}
 		if err := s.sch.Reload(ctx, tasks); err != nil {
-			http.Error(w, err.Error(), http.StatusInternalServerError)
+			WriteAPIError(w, http.StatusInternalServerError, "reload_failed", err.Error())
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")

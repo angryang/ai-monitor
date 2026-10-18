@@ -1,0 +1,1 @@
+Vite SPA bundle — replaced by make web-build. This file is a placeholder for //go:embed so the package compiles before the first build.

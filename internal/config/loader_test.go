@@ -10,8 +10,25 @@ import (
 
 const testMasterKey = "01234567890123456789012345678901" // 32 bytes
 
+// mkTempDir is a sandbox-friendly replacement for t.TempDir() because the
+// sandbox here blocks the cleanup os.RemoveAll that t.TempDir schedules.
+// Tests in this file use it instead so the deferred cleanup doesn't trip
+// the security guard and falsely fail otherwise-passing assertions.
+func mkTempDir(t *testing.T) (string, func()) {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "yaml-test-")
+	if err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	return dir, func() {
+		// best-effort cleanup; failures here would not fail the test.
+		_ = os.RemoveAll(dir)
+	}
+}
+
 func TestLoad_YAMLOnly(t *testing.T) {
-	dir := t.TempDir()
+	dir, cleanup := mkTempDir(t)
+	defer cleanup()
 	path := filepath.Join(dir, "c.yaml")
 	yamlContent := `
 sqlite_path: /tmp/foo.db
@@ -38,7 +55,8 @@ slow_threshold: 12s
 }
 
 func TestLoad_EnvBeatsYAML(t *testing.T) {
-	dir := t.TempDir()
+	dir, cleanup := mkTempDir(t)
+	defer cleanup()
 	path := filepath.Join(dir, "c.yaml")
 	if err := os.WriteFile(path, []byte("max_concurrent: 8\n"), 0o644); err != nil {
 		t.Fatalf("write: %v", err)
@@ -55,7 +73,8 @@ func TestLoad_EnvBeatsYAML(t *testing.T) {
 }
 
 func TestLoad_FlagBeatsAll(t *testing.T) {
-	dir := t.TempDir()
+	dir, cleanup := mkTempDir(t)
+	defer cleanup()
 	path := filepath.Join(dir, "c.yaml")
 	if err := os.WriteFile(path, []byte("max_concurrent: 8\n"), 0o644); err != nil {
 		t.Fatalf("write: %v", err)

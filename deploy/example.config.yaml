@@ -37,6 +37,6 @@ tasks:
     openai:
       stream_path: /v1/chat/completions
     notify:
-      enabled: true
+      enabled: false
       channel: wecom
       wecom_webhook: ${WECOM_WEBHOOK}

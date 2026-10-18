@@ -14,15 +14,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aibench/aibench/ai-monitor/internal/config"
-	"github.com/aibench/aibench/ai-monitor/internal/metrics"
-	"github.com/aibench/aibench/ai-monitor/internal/notifier"
-	"github.com/aibench/aibench/ai-monitor/internal/notifier/wecom"
-	"github.com/aibench/aibench/ai-monitor/internal/probe"
-	"github.com/aibench/aibench/ai-monitor/internal/protocol"
-	_ "github.com/aibench/aibench/ai-monitor/internal/protocol/openai"
-	"github.com/aibench/aibench/ai-monitor/internal/scheduler"
-	"github.com/aibench/aibench/ai-monitor/internal/server"
+	"github.com/angryang/ai-monitor/internal/config"
+	"github.com/angryang/ai-monitor/internal/metrics"
+	"github.com/angryang/ai-monitor/internal/notifier"
+	"github.com/angryang/ai-monitor/internal/notifier/wecom"
+	"github.com/angryang/ai-monitor/internal/probe"
+	"github.com/angryang/ai-monitor/internal/protocol"
+	_ "github.com/angryang/ai-monitor/internal/protocol/openai"
+	"github.com/angryang/ai-monitor/internal/scheduler"
+	"github.com/angryang/ai-monitor/internal/server"
 )
 
 // TestE2E_ProbeFiresAndMetricsExposed exercises the whole stack with a mock

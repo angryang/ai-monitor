@@ -10,8 +10,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aibench/aibench/ai-monitor/internal/config"
-	"github.com/aibench/aibench/ai-monitor/internal/protocol"
+	"github.com/angryang/ai-monitor/internal/config"
+	"github.com/angryang/ai-monitor/internal/protocol"
 )
 
 func newAdapter(t *testing.T) *Adapter {
@@ -196,5 +196,28 @@ func TestAnthropic_Probe_SendsExtraHeaders(t *testing.T) {
 	}
 	if got != "claude-canary-v3" {
 		t.Fatalf("X-Release-Name: got %q", got)
+	}
+}
+
+
+func TestAnthropic_Probe_GeneratesReqID(t *testing.T) {
+	var captured string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured = r.Header.Get("X-Req-Id")
+		w.WriteHeader(200)
+		_, _ = fmt.Fprint(w, "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
+	}))
+	defer srv.Close()
+	adapter := newAdapter(t)
+	cfg := baseTask()
+	cfg.BaseURL = srv.URL
+	s, err := adapter.Probe(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	for range s.Chunks() {
+	}
+	if captured == "" {
+		t.Fatalf("X-Req-Id missing")
 	}
 }

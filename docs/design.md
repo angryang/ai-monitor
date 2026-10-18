@@ -197,7 +197,7 @@ MetricSink
 - 结构化日志（task_id / duration / status 全链路）
 
 ### P2（可选）
-- Web UI（简单表单管理任务）
+- **P2-A · Web UI 任务管理**：`deploy/admin-ui.html`（单文件 HTML + Vue 3 CDN）已提供；零后端改动可读 + reload。要"新建/删除"需补 POST / PATCH / DELETE `/admin/tasks` 路由（apikey/webhook 在后端做 AES-GCM 加密后入库）。
 - 配置文件导入 / 导出
 - 多通知渠道（钉钉 / Slack / Email）
 - Pushgateway 模式
@@ -317,6 +317,14 @@ ai-monitor/
 
 ```go
 package protocol
+
+// X-Req-Id 是 ai-monitor 在每个 outbound 请求上携带的唯一标识，便于
+// 出问题时按 request id 在 AI 服务器侧日志定位。详见 §11.6.3。
+const RequestIDHeader = "X-Req-Id"
+
+// GenerateRequestID 给 req 注入 X-Req-Id（若已存在则保留）。generator
+// 可注入测试场景；默认走 uuid.NewString。生成结果返回便于调用方落日志。
+func GenerateRequestID(req *http.Request, generator func() string) string { ... }
 
 // Chunk 单个流式片段。
 type Chunk struct {
@@ -520,6 +528,29 @@ histogram_quantile(0.95,
 
 > Cardinality 影响：每个任务增加 1 个 label 维度，若 task_id < 100 量级可控。
 
+### 11.6.3 — X-Req-Id 自动注入（用户需求触发的设计补丁）
+
+**目标**：每次 probe 触发时携带唯一 `X-Req-Id` HTTP header，方便出问题时根据 request id 在 AI 服务器侧日志定位对应的拨测记录。
+
+**实现**：
+- `protocol.RequestIDHeader = "X-Req-Id"` 常量（`internal/protocol/adapter.go`）
+- `protocol.GenerateRequestID(req, generator func() string) string` helper：
+  - 若 req 已含 `X-Req-Id`（test 注入 / 用户 extras）→ 原样返回
+  - 否则用 generator（默认 `uuid.NewString`，RFC 4122 v4）生成一个，set 到 req.Header，返回
+  - generator 返回空字符串时会兜底用 uuid，不会让 header 在线上"空着"
+- `AdapterDeps.RequestIDGenerator func() string`（`internal/protocol/registry.go`）— 测试可注入确定性 generator
+- 三协议适配器（OpenAI / Anthropic / Gemini）在 `http.NewRequestWithContext` 后立刻、**在 `ApplyExtraHeaders` 之前**调用 `GenerateRequestID`
+
+**优先级约定**：
+1. 用户通过 `extra_headers` 显式给 `X-Req-Id` → 用户值生效（让上游 trace id 直接贯穿）
+2. 否则 ai-monitor 自动注入 uuid v4
+3. 用户只想用 ai-monitor 的 uuid，不传 extras 即可
+
+**未来可加**（不属于本期）：
+- 把 `req_id` 加进 slog logger context（与 `task_id` 同级），客户端日志可一行 grep
+- alert `Meta["req_id"]` 让告警消息也带上
+- 与 OpenTelemetry traceparent 协同（传递 `traceparent` 而非自造 `X-Req-Id`）
+
 ### 11.7 `internal/notifier/notifier.go`
 
 ```go
@@ -653,6 +684,97 @@ func (s *Server) Shutdown(ctx context.Context) error
 // 默认监听：:9090
 ```
 
+### 11.13 `internal/probe/store.go` + `store_sqlite.go`（**§18.11 增量**）
+
+> **背景**：P50/P90/P99 趋势图需要从聚合 Histogram 推算，但单点失败、上游 5xx 风暴、模型撤回等**「离散事件」**会淹没在 average 里。`ai_probe_request_total{status="failure"}` 只给累计数，看不到「5 分钟前哪一条 404 因为什么」。本节把每次探测的**实际结果**（status / error / TTFT / ITL / chunks / 时间戳）落 DB，让 admin 能按任务看历史。
+
+```go
+// Run 后立即写一行；Prune 在 Save 之后跑（crash-safe："略多" 比 "略少" 安全）。
+type RunStore interface {
+    Save(ctx context.Context, run *ProbeRun) error
+    ListByTask(ctx context.Context, taskID string, limit int) ([]ProbeRun, error)
+    Prune(ctx context.Context, keep int) error
+    Close() error
+}
+
+// 一个 ProbeRun 就是一次探测的"行式"画像。
+type ProbeRun struct {
+    ID         int64     `gorm:"primaryKey;autoIncrement" json:"id"`
+    TaskID     string    `gorm:"size:64;not null;index"        json:"task_id"`
+    TaskName   string    `gorm:"size:128;not null"             json:"task_name"`  // 反范式：任务改名/删后历史仍可读
+    Protocol   string    `gorm:"size:32;not null"              json:"protocol"`
+    Model      string    `gorm:"size:128;not null"             json:"model"`
+    Status     string    `gorm:"size:32;not null"              json:"status"`    // success / failure / unauthorized
+    Err        string    `gorm:"type:text"                      json:"error,omitempty"`
+    StartedAt  time.Time `gorm:"not null;index"                 json:"started_at"`
+    EndedAt    time.Time `gorm:"not null"                       json:"ended_at"`
+    DurationMS int64     `gorm:"not null"                       json:"duration_ms"`
+    TTFTMS     int64                                          json:"ttft_ms"`
+    ITLAvgMS   int64                                          json:"itl_avg_ms"`
+    ITLCount   int                                            json:"itl_count"`
+    Chunks     int      `gorm:"not null"                       json:"chunks"`
+}
+
+// 关键设计：probe 包用 FromResult(Result) ProbeRun 做适配，
+// 不让 probe 包 import GORM 类型，runner 也不持有 DB handle。
+```
+
+**SqliteRunStore**（`internal/probe/store_sqlite.go`）：
+
+- 共享 `config.SqliteStore.DB()` 的 `*gorm.DB` handle —— 不重开文件，避免 WAL / lock 冲突
+- `AutoMigrate` 在 main 启动时跑一次，GORM 只在 schema 不一致时写 `CREATE TABLE`
+- `ListByTask` 默认 `limit=20`，上限 `100`，SQL: `ORDER BY started_at DESC, id DESC LIMIT N`（id 是同毫秒平局兜底）
+- `Prune` 用 window function 一次性扫描所有任务，per-task 保留最新 N 条：
+  ```sql
+  DELETE FROM probe_runs
+  WHERE id NOT IN (
+    SELECT id FROM (
+      SELECT id, ROW_NUMBER() OVER (
+        PARTITION BY task_id
+        ORDER BY started_at DESC, id DESC
+      ) AS rn
+      FROM probe_runs
+    ) WHERE rn <= :keep
+  )
+  ```
+  默认 `keep=100`（30s schedule × 100 ≈ 50 分钟窗口）
+
+**与 runner 的接线**：
+
+```go
+func (r *Runner) Run(ctx context.Context, t config.TaskConfig) Result {
+    res := Result{...}
+    // 关键：defer **传指针**——`defer f(args)` 在 defer 语句处按值求值，
+    // 传 res 值会拿到零值 Result。传 &res，deferred 调用能看到全部字段。
+    defer r.persistRun(&res)
+    // ... 探测逻辑 ...
+    return res
+}
+
+func (r *Runner) persistRun(res *Result) {
+    if r.RunStore == nil { return }
+    run := FromResult(*res)
+    ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+    defer cancel()
+    r.RunStore.Save(ctx, &run)         // 错误仅 log，不影响 cron 下一次 tick
+    r.RunStore.Prune(ctx, r.RunRetention)
+}
+```
+
+> **错误裁剪**：`r.Err.Error()` 截到 4096 字符。网络错误可能含整个 HTML body（几 KB），避免 SQLite text 列无限增长。
+
+**新端点**：
+
+```
+GET /admin/tasks/{id}/runs?limit=20
+→ 200 {"runs": [ProbeRun, ProbeRun, ...]}      # 新→旧
+→ 404 task_not_found                          # id 不存在
+→ 400 bad_limit                               # limit 不是正整数
+→ 503 run_store_disabled                      # RunStore=nil（防误关）
+```
+
+`limit` 默认 20、上限 100。RBAC 同其它 `GET /admin/*`：viewer / admin 都可读（只读不写）。
+
 ---
 
 ## 12. DB Schema
@@ -693,6 +815,35 @@ CREATE TABLE tasks (
     updated_at  DATETIME
 );
 ```
+
+**`probe_runs` 表（**§18.11 增量**）** —— 每次探测一行，admin 看历史趋势/失败溯源：
+
+```sql
+CREATE TABLE probe_runs (
+    id          INTEGER      PRIMARY KEY AUTOINCREMENT,
+    task_id     VARCHAR(64)  NOT NULL,                      -- 关联 tasks.id
+    task_name   VARCHAR(128) NOT NULL,                      -- 反范式：删/改名后历史仍可读
+    protocol    VARCHAR(32)  NOT NULL,
+    model       VARCHAR(128) NOT NULL,
+    status      VARCHAR(32)  NOT NULL,                      -- success / failure / unauthorized
+    err         TEXT,                                        -- 截到 4096 字符
+    started_at  DATETIME     NOT NULL,
+    ended_at    DATETIME     NOT NULL,
+    duration_ms INTEGER      NOT NULL,
+    ttft_ms     INTEGER      NOT NULL DEFAULT 0,
+    itl_avg_ms  INTEGER      NOT NULL DEFAULT 0,
+    itl_count   INTEGER      NOT NULL DEFAULT 0,
+    chunks      INTEGER      NOT NULL DEFAULT 0
+);
+CREATE INDEX idx_probe_runs_task_id    ON probe_runs(task_id);
+CREATE INDEX idx_probe_runs_started_at ON probe_runs(started_at);
+```
+
+> **设计要点**：
+> - **共享 `*gorm.DB`**：`probe_runs` 与 `tasks` 共用 `config.SqliteStore.DB()` 句柄，不重开文件，避免 WAL/lock 冲突。
+> - **GORM AutoMigrate**：`main` 启动时跑一次，schema 不一致时才发 `CREATE TABLE / INDEX`，幂等。
+> - **Prune 用窗口函数**：见 §11.13 的 SQL，单条 DELETE 把所有任务的历史裁到 `keep` 条（默认 100）。
+> - **RBAC**：`GET /admin/tasks/{id}/runs` 与其它 GET 同权限（viewer / admin 都可读）。
 
 ---
 
@@ -771,6 +922,14 @@ sequenceDiagram
     end
     Run->>Sem: Release(1)
     Run->>Sink: SetSchedulerLag
+
+    Note over Run: === §18.11 增量 · 探测结果落库 ===
+    Run->>RunStore: Save(probe_run)         # defer(persistRun) 触发
+    Run->>RunStore: Prune(keep=100)          # 一次窗口函数裁剪所有任务
+    alt Save 失败（log only）
+        RunStore-->>Run: error
+        Run->>Run: log warn，不影响下次 tick
+    end
 ```
 
 ### 13.3 热更新（P1）
@@ -886,6 +1045,7 @@ graph TD
 | P1-B | 协议校验 + 结构化日志 + 优雅关闭 | P1 | G2 | P1 |
 | P1-C | 协议级 ExtraHeaders 收口（OpenAI/Anthropic/Gemini 全量） + 灰度用例示例 | P1 | C2,C3,C4 | P1 |
 | P1-D | Histogram 分桶拆分 + scheduler_lag 升 Histogram + canary_group label（精度支撑 P50/P90/P95/P99） | P1 | D1 | P1 |
+| J1 | 探测结果落库（RunStore + `probe_runs` 表 + `GET /admin/tasks/{id}/runs` + Prune 策略） | J | G1,B2 | P1 |
 
 ### 15.2 详细任务卡（关键 P0）
 
@@ -1056,7 +1216,8 @@ graph TD
 
 ### 17.1 待用户拍板（≥5）
 
-1. **灰度（Canary）流量测试支持范围**（⚠️ **新增项，用户原始需求触发的设计补丁**）：是否启用 P1-C「协议级 ExtraHeaders 收口」？主要用途是同域名 Header 触发网关路由、跨实例 A/B 对比、租户级灰度，还是别的场景？是否需要在 metrics label 上新增 `canary_group` 维度方便对比？
+1. **Web UI 任务管理**（⚠️ **新增项，用户问题触发的 P2-A 落地评估**）：是否落地？落地要补 3 个后端路由（POST / PATCH / DELETE `/admin/tasks`，apikey/webhook 在后端做 AES-GCM 加密后入库），约 30 分钟工作量；是否同时把 `deploy/admin-ui.html` 用 `//go:embed` 嵌入二进制，新增 `GET /admin/` 路由（让 UI 与 API 同源，跨域更顺）？否则只能 nginx/caddy 反代或跨域。
+2. **灰度（Canary）流量测试支持范围**（⚠️ **新增项，用户原始需求触发的设计补丁**）：是否启用 P1-C「协议级 ExtraHeaders 收口」？主要用途是同域名 Header 触发网关路由、跨实例 A/B 对比、租户级灰度，还是别的场景？是否需要在 metrics label 上新增 `canary_group` 维度方便对比？
 2. **Master Key 来源**：env `AI_MONITOR_MASTER_KEY` 还是 K8s Secret 挂载？是否需要密钥轮转？
 3. **HTTP 服务端口与绑定**：默认 `:9090` 是否绑 `0.0.0.0`？`/admin` 是否需要 basic auth / token？
 4. **SQLite 驱动**：是否接受 pure-Go `glebarez/sqlite`？是否需 CGO 版追求极致写入？
@@ -1085,7 +1246,615 @@ graph TD
 
 ---
 
-# 附录 A · Mermaid 文件独立产物
+## 18. 增量 · 前端 + Auth/RBAC（用户要求：登录页 + admin 增删 / viewer 只读）
+
+> 状态：架构已敲定，工程师一次性实现 T01–T05
+> 本章为对已有 PRD + 架构 §9–§17 的**追加**；不复述既有结论
+
+### 18.1 角色与边界
+
+| 角色 | 权限 | 入口 |
+|---|---|---|
+| `admin` | 任务 CRUD + 用户管理 + 改自己密码 | 全部路径 |
+| `viewer` | GET /admin/tasks、GET /metrics、看仪表盘、看 profile | 仅 read-only |
+
+关系：**viewer ⊂ admin**。防御纵深：前端隐藏 + 后端强制 `auth.Middleware.RequireRole(admin)`。
+
+### 18.2 端点（新增与调整）
+
+| Method | Path | 鉴权 | 角色 |
+|---|---|---|---|
+| POST | `/auth/login` | 否 | — |
+| POST | `/auth/logout` | 是 | 任意 |
+| GET | `/auth/me` | 是 | 任意 |
+| POST | `/auth/change-password` | 是 | 任意 |
+| GET / POST / PATCH / DELETE | `/admin/users[/{id}]` | 是 | admin |
+| POST | `/auth/users/seed` | **启动期内部** | — |
+| GET | `/admin/tasks/{id}` | 是 | 任意 |
+| POST / PATCH / DELETE | `/admin/tasks[/{id}]` | 是 | admin |
+| GET / POST | 其余保持设计 §11.12 | — | — |
+
+### 18.3 用户表（新增）
+
+```sql
+CREATE TABLE users (
+    id            VARCHAR(64)  PRIMARY KEY,
+    username      VARCHAR(64)  NOT NULL UNIQUE,
+    password_hash VARCHAR(255) NOT NULL,        -- bcrypt cost=12
+    role          VARCHAR(16)  NOT NULL,
+    display_name  VARCHAR(128),
+    enabled       BOOLEAN      NOT NULL DEFAULT 1,
+    created_at    DATETIME,
+    updated_at    DATETIME
+);
+```
+
+`tasks` 表 schema 不变。
+
+### 18.4 视觉定调（frontend-design skill 已锁）
+
+- 目的：SRE / 运维后台；登录、管理 AI 探测任务、查看实时指标
+- 调性：**Industrial**——等宽数字、状态色体系、发丝边框、高密度
+- 字体：JetBrains Mono（数字/展示）+ IBM Plex Sans（正文）；**禁 Inter/Roboto**
+- 配色（暗色基调）：bg `#0e0d0c` / surface `#171614` / text `#f5f1ea` / accent **琥珀 `#ff6b2c`**；状态色 success/warn/danger 分别 `#14a06d` / `#d6a514` / `#d8443f`
+- 构成：280px 侧栏 + 56px 顶栏 + 12-grid；表格 + 行 hover 信息抽屉
+- 记忆点：登录页背景 = 实时 latency 折线心跳；仪表盘顶部 = P95 呼吸灯随健康度变色
+
+### 18.5 完整 tokens.css 与组件骨架
+
+完整 tokens.css（字面复制到 `web/src/styles/tokens.css`）：
+
+```css
+:root {
+  --bg: #0e0d0c; --surface: #171614; --surface-2: #211e1b; --surface-3: #2b2723;
+  --text: #f5f1ea; --muted: #a09a90; --muted-2: #6e6962;
+  --border: rgba(245,241,234,.12); --border-strong: rgba(245,241,234,.22);
+  --accent: #ff6b2c; --accent-2: #ff8a5b; --accent-soft: rgba(255,107,44,.16);
+  --ok: #14a06d; --warn: #d6a514; --danger: #d8443f; --info: #5b8def;
+  --font-display: "JetBrains Mono", "SF Mono", ui-monospace, Menlo, Consolas, monospace;
+  --font-body: "IBM Plex Sans", "PingFang SC", -apple-system, "Helvetica Neue", sans-serif;
+  --font-mono: "JetBrains Mono", "SF Mono", ui-monospace, monospace;
+  --fs-11: 11px; --fs-12: 12px; --fs-13: 13px; --fs-14: 14px;
+  --fs-16: 16px; --fs-20: 20px; --fs-24: 24px; --fs-32: 32px;
+  --fs-48: 48px; --fs-72: 72px;
+  --fs-display: clamp(48px, 6vw, 72px);
+  --lh-tight: 1.15; --lh-base: 1.5; --lh-loose: 1.7;
+  --fw-regular: 400; --fw-medium: 500; --fw-semibold: 600; --fw-bold: 700;
+  --space-1: 4px; --space-2: 8px; --space-3: 12px; --space-4: 16px;
+  --space-5: 24px; --space-6: 32px; --space-7: 48px; --space-8: 64px;
+  --radius-sm: 4px; --radius-md: 8px; --radius-lg: 14px; --radius-pill: 999px;
+  --shadow-1: 0 2px 6px rgba(0,0,0,.32);
+  --shadow-2: 0 12px 32px rgba(0,0,0,.48);
+  --shadow-glow: 0 0 0 1px var(--accent), 0 0 24px rgba(255,107,44,.25);
+  --ease-out: cubic-bezier(.16, 1, .3, 1);
+  --ease-spring: cubic-bezier(.34, 1.56, .64, 1);
+  --dur-fast: 160ms; --dur-base: 320ms; --dur-slow: 640ms;
+  --sidebar-w: 280px; --topbar-h: 56px; --container: 1200px; --gutter: 16px;
+  font-variant-numeric: tabular-nums;
+}
+```
+
+详见架构产出的 §1.3.2（含 `[data-theme="light"]` 与 base.css / animations.css 摘要）。
+
+### 18.6 嵌入到二进制的方案
+
+- 前端产物 `web/dist/` 通过 `//go:embed` 进 `internal/webui/embed.go`
+- `internal/server/static.go` 提供 SPA fallback：API 路由优先命中，其它路径 → `index.html`
+- `mux.Handle("GET /", staticHandler)` + `mux.Handle("GET /assets/", staticHandler)`
+- 单二进制交付；零 CORS；零跨域
+
+### 18.7 任务清单（5 个集成任务 · 工程师一次性实现）
+
+| ID | 标题 | 涉及主要文件 |
+|---|---|---|
+| T01 | 项目基础设施（依赖 + embed 骨架 + Vite 起步） | go.mod、internal/webui/embed.go、cmd/main.go、Web/package.json 等 |
+| T02 | 后端 auth + RBAC（users 表 / JWT / bcrypt / 中间件 / seed） | internal/auth/*、main.go |
+| T03 | 后端 handlers（auth + admin user + admin task CRUD）+ SPA fallback | internal/server/* |
+| T04 | 前端骨架 + 视图（tokens.css / 9 视图 / RBAC 双层防御） | web/src/* |
+| T05 | 特色组件（LatencyHeartbeat + BreathingLight）+ 集成 + e2e + 收尾 | web/src/components/fx/*、e2e、README、design.md §18 |
+
+完整步骤与失败测试用例集合见架构 §1.6（每个 T 内含 5–10 步与 4–10 个 TDD 失败用例）。
+
+### 18.8 端到端 RBAC 矩阵（必含）
+
+| Route × Method | no-token | viewer | admin |
+|---|---|---|---|
+| POST `/auth/login` | 200 | 200 | 200 |
+| GET `/auth/me` | 401 | 200 | 200 |
+| GET `/admin/tasks[/id]` | 401 | 200 | 200 |
+| POST/PATCH/DELETE `/admin/tasks[/id]` | 401 | **403** | 200 |
+| GET/POST/PATCH/DELETE `/admin/users[/id]` | 401 | **403** | 200 |
+| GET `/metrics` | 200 | 200 | 200 |
+| GET `/healthz` | 200 | 200 | 200 |
+| GET `/` | 200 (SPA) | 200 | 200 |
+
+### 18.9 环境变量（新增）
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `AI_MONITOR_JWT_SECRET` | **必填** ≥ 32 字节 | JWT HS256 密钥；未设 → 启动失败 |
+| `AI_MONITOR_ADMIN_USERNAME` | `admin` | 启动期 seed 用户名 |
+| `AI_MONITOR_ADMIN_PASSWORD` | 强随机 + WARN 一次性 | 启动期 seed 密码 |
+
+`AI_MONITOR_MASTER_KEY` / `AI_MONITOR_HTTP_ADDR` / `AI_MONITOR_SQLITE_PATH` 沿用既有。
+
+### 18.10 反 AI 味自检清单（frontend-design skill §7 对齐）
+
+- 展示字避开 Inter/Roboto/Arial/system-ui → 强制 JetBrains Mono + IBM Plex Sans
+- 强调色单焦点（琥珀）→ 状态色独立体系
+- 非对称 + 编辑密度 → 280 侧栏 + 56 顶栏 + 12-grid
+- 编排动效有意义 → LatencyHeartbeat 与 BreathingLight 直接对应产品语境
+- 氛围层（contextual）→ 心跳折线 = 监控系统的"监控"主题
+- 8 种状态全覆盖 → loading/empty/error/success/warning/info/disabled/focused
+- 视觉唯一性 → 不引 chart.js / echarts；8 metric 卡全部手写 + tabular-nums
+- 降级动效 → `prefers-reduced-motion: reduce` 全局关
+
+CI 强制：`grep -RE '(Inter|Roboto|Arial|tailwind|ant-design|element-plus)' web/src` 必须空。
+
+---
+
+### 18.11 增量 · 探测结果落库（`probe_runs` + `RunStore`）
+
+> **触发场景**：指标 Histogram 能撑出 P50/P90/P99 趋势，但「单点失败」「上游 5xx 风暴」「模型撤回」这类**离散事件**会被 average 抹平；`ai_probe_request_total{status="failure"}` 只给累计数，admin 想看「5 分钟前哪一条 404 因为什么」必须落 DB。
+
+#### 18.11.1 目标
+
+- 每次探测写一行 `probe_runs`（status / err / TTFT / ITL / chunks / 时间戳）
+- 新增 `GET /admin/tasks/{id}/runs?limit=20` 让 admin 在 UI 上点任务 → 看历史
+- 保留最近 N 条/任务（默认 100），老数据自动 Prune，避免 SQLite 无限膨胀
+- 不破坏现有 P0：新增独立包 + 独立端点 + 独立表，老的 metric / notifier / scheduler 路径零改动
+
+#### 18.11.2 关键设计决策
+
+| 决策 | 选 A | 选 B | 选 A 的理由 |
+|---|---|---|---|
+| 落谁 | **Runner 自己 defer 落** | 中间件统一 hook | defer 拿得到最终 status（success / failure / unauthorized），middleware 只能拿 HTTP-level |
+| 接口位置 | **新包 `internal/probe/store.go`** | 塞 `internal/config/store.go` | `config` 包管的是「任务配置」，不掺「执行结果」；新包职责单一 |
+| DB 连接 | **共享 `config.SqliteStore.DB()`** | probe 包自己开 | WAL / lock 不冲突，少一个 file handle；AutoMigrate 一次跑完两张表 |
+| Prune 策略 | **per-task 保留最新 N 条（window function）** | 定期全部清 | 「30s schedule × 100 ≈ 50 分钟窗口」对调试够用，且每任务都有最近窗口 |
+| 写失败处理 | **log warn，不影响 cron 下一次 tick** | panic / retry | cron 调度优先于审计；落库是 best-effort |
+| 反范式 `task_name` | **写进 `probe_runs`** | join `tasks` | 任务改名/删除后历史仍可读；join 多一次 IO |
+| Err 长度 | **截到 4096 字符** | 全文存 | 网络错误可能含几 KB HTML body，截断避免 text 列爆炸 |
+| 写时延保护 | **`context.WithTimeout(2s)`** | 无超时 | Save 卡住会让后续探测累积；2s 兜底 |
+
+#### 18.11.3 数据模型与代码
+
+```go
+// internal/probe/store.go
+type RunStore interface {
+    Save(ctx context.Context, run *ProbeRun) error
+    ListByTask(ctx context.Context, taskID string, limit int) ([]ProbeRun, error)
+    Prune(ctx context.Context, keep int) error
+    Close() error
+}
+
+type ProbeRun struct {
+    ID         int64     `gorm:"primaryKey;autoIncrement" json:"id"`
+    TaskID     string    `gorm:"size:64;not null;index"        json:"task_id"`
+    TaskName   string    `gorm:"size:128;not null"             json:"task_name"`
+    Protocol   string    `gorm:"size:32;not null"              json:"protocol"`
+    Model      string    `gorm:"size:128;not null"             json:"model"`
+    Status     string    `gorm:"size:32;not null"              json:"status"`
+    Err        string    `gorm:"type:text"                      json:"error,omitempty"`
+    StartedAt  time.Time `gorm:"not null;index"                 json:"started_at"`
+    EndedAt    time.Time `gorm:"not null"                       json:"ended_at"`
+    DurationMS int64     `gorm:"not null"                       json:"duration_ms"`
+    TTFTMS     int64                                          json:"ttft_ms"`
+    ITLAvgMS   int64                                          json:"itl_avg_ms"`
+    ITLCount   int                                            json:"itl_count"`
+    Chunks     int      `gorm:"not null"                       json:"chunks"`
+}
+```
+
+**Prune SQL**（一次 DELETE 扫所有任务，per-task 保留最新 N）：
+
+```sql
+DELETE FROM probe_runs
+WHERE id NOT IN (
+  SELECT id FROM (
+    SELECT id, ROW_NUMBER() OVER (
+      PARTITION BY task_id ORDER BY started_at DESC, id DESC
+    ) AS rn
+    FROM probe_runs
+  ) WHERE rn <= :keep
+)
+```
+
+#### 18.11.4 Runner 接线（**defer 传指针的关键修复**）
+
+```go
+func (r *Runner) Run(ctx context.Context, t config.TaskConfig) Result {
+    res := Result{...}
+    // 关键：defer f(args) 按值求值。传 res 值 → deferred 拿到零值 Result，
+    // 全部 started_at=0001-01-01、duration_ms=0；传 &res → 看到最终字段。
+    defer r.persistRun(&res)
+    // ... 探测逻辑 ...
+    return res
+}
+
+func (r *Runner) persistRun(res *Result) {
+    if r.RunStore == nil { return }            // 防误关：nil RunStore 不阻塞 cron
+    run := FromResult(*res)
+    ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+    defer cancel()
+    if err := r.RunStore.Save(ctx, &run); err != nil {
+        log.Warn("probe_run save failed", "err", err)   // best-effort
+    }
+    _ = r.RunStore.Prune(ctx, r.RunRetention)
+}
+```
+
+#### 18.11.5 新端点
+
+```
+GET /admin/tasks/{id}/runs?limit=20
+→ 200 {"runs": [ProbeRun, ProbeRun, ...]}    # 新→旧
+→ 400 bad_limit                             # limit 非正整数 / 超 100
+→ 404 task_not_found                         # id 不存在
+→ 503 run_store_disabled                     # RunStore=nil（防误关）
+```
+
+`limit` 默认 20、上限 100。RBAC 同其它 GET：viewer / admin 都可读。
+
+#### 18.11.6 接线图
+
+```
+cmd/ai-monitor/main.go
+ ├─ config.NewSqliteStore(...)  ──┐
+ ├─ probe.NewSqliteRunStore(store.DB()) ──┐  // 共享 *gorm.DB
+ ├─ runner.RunStore  = runStore            │
+ └─ server.Options.RunStore = runStore      │
+                                          │
+internal/probe/runner.go                  │
+ └─ defer r.persistRun(&res)               │
+     ├─ RunStore.Save(ctx, run)            │
+     └─ RunStore.Prune(ctx, keep=100)      │
+                                          │
+internal/server/admin_task_handlers.go    │
+ └─ mux.Handle("GET /admin/tasks/{id}/runs", listRunsHandler)
+```
+
+#### 18.11.7 验收（实施时勾）
+
+- [ ] 创建任务 A → 立刻看到 1 条 run
+- [ ] 等 30s → 看到第 2 条
+- [ ] `GET /admin/tasks/{id}/runs?limit=10` 返回新→旧数组
+- [ ] 手工改 keep=5，等一轮 Prune → 历史裁到 5 条
+- [ ] 故意填超长 err（>4 KB）→ DB 里只存 4096 字符
+- [ ] Save 抛错（关掉 DB 文件）→ cron 下一次 tick 不受影响
+- [ ] defer 拿到的 started_at 等于实际 run 开始时间（不是零值）
+- [ ] RBAC：viewer 也能看 runs
+
+#### 18.11.8 不在范围内（留 P2）
+
+- 按时间段过滤（`?from=&to=`）
+- 按 status 过滤（`?status=failure`）
+- 按 error 模糊搜索（`?err_like=timeout`）
+- CSV 导出
+- 单独 `GET /admin/runs` 全局最近 N 条（不分任务）
+
+---
+
+### 18.12 增量 · 监测任务启动 / 停止（默认不自动开启）
+
+> **触发场景**：上一版 POST 出来的任务立刻被 cron 拉起来，导致「刚配、参数还没填好、误触发」三种姿势接连发生。任务应该「先建好再启」，start / stop 是显式动作。
+
+#### 18.12.1 目标
+
+- 新建任务默认 `Enabled=false`（POST 不传 `enabled` 字段时）
+- 提供 `POST /admin/tasks/{id}/start` 与 `POST /admin/tasks/{id}/stop` 两个专用端点
+- start / stop 同时改 SQLite `enabled` 字段 + 调度器的 cron 注册；两边保持一致
+- 已 enabled 的任务再 `start` 或已 disabled 的任务再 `stop`：幂等返回 200，不重复操作
+- 旧有存量的 `enabled=true` 任务保留原状（不写 migration），由管理员按需手动 `stop`
+
+#### 18.12.2 关键设计决策
+
+| 决策 | 选项 | 选择 | 理由 |
+|---|---|---|---|
+| 新建任务默认 `enabled` | `true`（旧）/ `false`（新） | **false** | 「先建好再启」减少误触；显式 start 是单一开关 |
+| 默认值影响范围 | 仅新建 / 含存量 migration | **仅新建** | 存量任务保留原状，admin 主动 stop；不偷偷改变行为 |
+| start / stop 接口形态 | 复用 PATCH / 专用端点 / 二者皆有 | **专用端点** | 语义清晰；admin 一次只切一个动作；不与 PATCH 的「整体配置更新」混用 |
+| scheduler `Add` / `Reload` 是否读 `enabled` | 否（旧）/ 是（新） | **是（纵深防御）** | 任何绕开 HTTP 的路径（reload、watcher）都不会让 disabled 任务被调度 |
+| 写顺序 | 先 DB 后 sched / 先 sched 后 DB | **start: DB→sched；stop: sched→DB** | start 失败能「回滚 enabled=false」；stop 失败 cron 已停不会幽灵 fire |
+| RBAC | viewer / admin | **admin** | §18.8 矩阵：写类端点一律 admin |
+
+#### 18.12.3 数据流（start 路径）
+
+```
+admin → POST /admin/tasks/{id}/start
+        │
+        ▼
+ AdminTaskHandlers.start()
+        │
+   ┌────┴─────────────────────────────────┐
+   ▼                                      │
+ Store.GetTask(id)            ←─ 同 §18 已有   │
+   │ existing.Enabled = false ?            │
+   ├─ 是 ──→ Store.UpdateTask(existing{Enabled:true})
+   │            │                          │
+   │            ├─ 失败 → 500 persist_failed
+   │            ▼
+   │        Scheduler.Add(*existing)
+   │            │  (scheduler.Add 守卫：若 Enabled=false 返回 nil)
+   │            ├─ 失败 → Store.UpdateTask 回滚 enabled=false → 500 schedule_failed
+   │            ▼
+   │        respondStoredTask(200)
+   │
+   └─ 否（已 enabled）→ 直接返回 200（幂等）
+```
+
+stop 路径镜像上面的流程，但次序反转：先 `Scheduler.Remove(id)`（idempotent），再 `Store.UpdateTask(... enabled:false)`。
+
+#### 18.12.4 关键代码（节选）
+
+**`internal/scheduler/scheduler.go`：**
+
+```go
+// Add registers a single task. Disabled tasks are silently skipped so the
+// scheduler's effective schedule always equals "the subset of tasks whose
+// Enabled flag is true at the moment of call".
+func (s *cronScheduler) Add(task config.TaskConfig) error {
+    if !task.Enabled {
+        return s.Remove(task.ID) // retract any lingering cron entry
+    }
+    if _, ok := s.entries[task.ID]; ok {
+        return s.Remove(task.ID)
+    }
+    id, err := s.cron.AddFunc(task.Schedule, func() { s.fire(task) })
+    if err != nil {
+        return fmt.Errorf("scheduler: invalid cron expression %q: %w", task.Schedule, err)
+    }
+    s.mu.Lock()
+    s.entries[task.ID] = id
+    s.mu.Unlock()
+    return nil
+}
+```
+
+`Reload()` 同样：不读 `enabled` 的任务不进 `entries`，已经是 enabled 后被改 disabled 的会先 `Remove` 再跳过 Add。
+
+**`internal/server/admin_task_handlers.go`：**
+
+```go
+func (h *AdminTaskHandlers) start(w http.ResponseWriter, r *http.Request) {
+    if h.cfg.Store == nil || h.cfg.Scheduler == nil { /* 503 */ }
+    id := r.PathValue("id")
+    existing, err := h.cfg.Store.GetTask(r.Context(), id)
+    if err != nil { /* 404 task_not_found */ }
+    if existing.Enabled { /* idempotent 200 */ }
+    existing.Enabled = true
+    if err := h.cfg.Store.UpdateTask(...); err != nil { /* 500 start_persist_failed */ }
+    if err := h.cfg.Scheduler.Add(*existing); err != nil {
+        existing.Enabled = false
+        _ = h.cfg.Store.UpdateTask(...)  // 回滚 DB
+        /* 500 start_schedule_failed */
+    }
+    respondStoredTask(w, 200, existing)
+}
+```
+
+`stop` 函数镜像：`Scheduler.Remove(id)` 先；DB 后；幂等。
+
+#### 18.12.5 新端点 / 默认值
+
+| 项 | 旧 | 新 |
+|---|---|---|
+| `POST /admin/tasks` 默认 `enabled` | `true` | **`false`** |
+| `POST /admin/tasks/{id}/start` | — | **新增** |
+| `POST /admin/tasks/{id}/stop` | — | **新增** |
+
+两个新端点的 RBAC：同 `POST/PATCH/DELETE /admin/tasks` —— **401 无 token / 403 viewer / 200 admin**（§18.8）。
+
+响应统一为 `taskResponse`（与 GET / POST / PATCH 同 shape），secret 字段按 `redactTask` 规则清除。
+
+#### 18.12.6 接线图（main → server）
+
+```
+cmd/ai-monitor/main.go
+├── store (config.SqliteStore) ────┐
+│                                  ├──► server.Options
+├── scheduler (cronScheduler) ──────┤        │
+├── runStore (probe.SqliteRunStore) ┤        ├──► NewAdminTaskHandlers
+└── auth.Middleware + UserStore  ───┘        │       │
+                                              ▼       │
+                                       AdminTaskHandlersConfig{
+                                         Store:     …,
+                                         Scheduler: …,   ← 新增
+                                         RunStore:  …,
+                                         Auth:      …,
+                                         …
+                                       }
+                                              │
+                                              ▼
+                                       Mux:  POST /admin/tasks/{id}/start  (admin)
+                                       Mux:  POST /admin/tasks/{id}/stop   (admin)
+                                       Mux:  POST /admin/tasks               (admin, 现在默认 enabled=false)
+```
+
+#### 18.12.7 验收（实施时勾）
+
+- [ ] POST 不带 `enabled` 的 task → DB 行 `enabled=0`，cron 没注册
+- [ ] 立即 `curl /admin/tasks/{id}/runs` → 空数组（不 fire）
+- [ ] POST `/admin/tasks/{id}/start` → 200，response `enabled=true`
+- [ ] cron 立即按 schedule fire（用一个 `@every 1m` 等待 60s 也行，或人工 `POST /admin/tasks/{id}/run-now` P2 不做，靠时间）
+- [ ] 再 POST `/start` → 仍 200，DB / scheduler 都无副作用（idempotent）
+- [ ] POST `/admin/tasks/{id}/stop` → 200，response `enabled=false`，cron 立即停
+- [ ] start 期间 scheduler.Add 抛错 → 响应 500 + `start_schedule_failed`；DB `enabled` 被回滚为 false
+- [ ] stop 期间 store.UpdateTask 抛错 → 响应 500；cron 已停，下一次 reload 才会恢复
+- [ ] viewer 调用 `/start` 或 `/stop` → 403（§18.8 RBAC）
+- [ ] 旧存量任务 `enabled=true` 启动后被 `sched.Reload(tasks)` 加载 → 仍按原 schedule fire（不被新默认值影响）
+- [ ] 单元测试：`TestScheduler_Add_DisabledIsNoOp` / `TestScheduler_Reload_DisabledSkipped` / `TestScheduler_Reload_DisablingActiveRetracts` 全 PASS
+- [ ] 单元测试：`TestStartTask_*` × 5 + `TestStopTask_*` × 3（8 个 handler 测试）全 PASS
+
+#### 18.12.8 不在范围内（留 P2）
+
+- POST `/admin/tasks/{id}/run-now`（立即触发一次 probe，不依赖 cron）
+- 批量 start / stop：`POST /admin/tasks/batch/start` `{"ids":[...]}`
+- 任务调度健康度面板（已 start 但调度器未 fire 的告警）
+- 占用磁盘 / 调度器 entry 上限的告警（P1 `task_count` fail-fast 已有了）
+
+---
+
+### 18.13 增量 · 监控记录增加请求内容 / 返回内容 / x-req-id
+
+> **触发场景**：每条 probe 失败时，admin 想知道「究竟是什么请求发出去的，服务器究竟回了什么字节」。原有 `probe_runs` 只留 `Err` 摘要（首 4 KiB），无法定位 SSE 中段 / OpenAI 截断响应 / Anthropic 异常的尾部 frame。
+
+#### 18.13.1 目标
+
+- `probe_runs` 新增 5 个字段：`request_id`、`request_body`、`response_head`、`response_tail`、两个 `*_truncated` 标志位
+- 数据来源全复用：协议 adapter 已在 `internal/protocol/adapter.go:81` 自动注入 `X-Req-Id: <uuid v4>` 到 outbound header —— 这部分信号之前被丢弃，本次接住
+- 请求 body 用 32 KiB 硬上限；响应截 HAR 风格「head + tail」各 4 KiB，丢弃中段
+- `GET /admin/tasks/{id}/runs` 自动带新字段（无 schema 变更 break）
+
+#### 18.13.2 关键设计决策
+
+| 决策 | 选项 | 选择 | 理由 |
+|---|---|---|---|
+| 响应 body 抓策略 | 全部 / 仅首 N / 首 N + 尾 N（HAR） | **HAR：head 4 KiB + tail 4 KiB + truncated 标记** | 调试能看首消息 + 错误 + 结束标志；disk 可控；与 /admin/tasks/{id}/runs limit 配合 |
+| 请求 body 上限 | 64 KiB / 32 KiB / 不限 | **32 KiB（截断 + truncated 标志位）** | OpenAI / Anthropic 实际请求体常 2-8 KiB；32 KiB 覆盖长 system prompt + 多轮示例；超出时前端可显示提示 |
+| X-Req-Id 字段名 / 大小 | VARCHAR(64) / VARCHAR(128) | **VARCHAR(128)，加索引** | UUID v4 = 36 字符；用户可注入长 trace id（阿里云 / 字节链式 trace），128 是覆盖上行 |
+| API 形状变化 | 增字段 / 拆子端点 | **增字段（admin-only 取数无 RBAC 变化）** | viewer 看 runs 也是只读，加字段无破坏 |
+| 旧 row 兼容 | 加列 NULL / 加列默认值 | **NULL / `false`** | GORM AutoMigrate 自动加列 + `gorm:"not null;default:false"` |
+| capture 位置 | adapter 内 / runner 内 | **adapter 内 `ProbeStream` 暴露，runner 汇总** | adapter 知道 protocol 特定的字节拼装；runner 只做"读 3 个方法 + 1 个截断判定" |
+
+#### 18.13.3 ProbeStream 扩展 + capture 路径
+
+`internal/protocol/adapter.go` 的 `ProbeStream` interface 加 3 个方法：
+
+```go
+type ProbeStream interface {
+    Chunks() <-chan Chunk
+    Err() error
+    Close() error
+    // §18.13 wire capture
+    RequestID() string                      // X-Req-Id used on outbound request
+    RequestBody() []byte                    // raw JSON body POSTed to upstream
+    ResponseSnapshot() (head, tail []byte, truncated bool)
+}
+```
+
+每个 adapter (`openai.go` / `anthropic.go` / `gemini.go`) 在 `stream` struct 上加私有字段，在 `Probe()` 里：
+
+1. `protocol.TruncateRequest(body, 32 KiB)` 拿到截断的 body —— 同时 set `stream.requestBody`
+2. `protocol.GenerateRequestID(req, a.rid)` 拿到返回值（之前丢弃）—— set `stream.requestID`
+3. `protocol.NewRespCapture(4 KiB, 4 KiB)` 拿到 capture —— 用 `io.TeeReader(resp.Body, capture)` 喂给 scanner/reader
+
+`consume()` 跑完关闭 channel 后，runner 从 stream 读取 3 个 accessor 写入 `Result`，并按 `len(body) ≥ 32 KiB` 标 `RequestTruncated`。
+
+#### 18.13.4 数据模型与代码
+
+**`internal/probe/store.go：ProbeRun`**：
+
+```go
+type ProbeRun struct {
+    // ... 原有 14 列 ...
+    // §18.13 新增 5 列
+    RequestID        string `gorm:"size:128;index" json:"request_id,omitempty"`
+    RequestBody      string `gorm:"type:text" json:"request_body,omitempty"`
+    ResponseHead     string `gorm:"type:text" json:"response_head,omitempty"`
+    ResponseTail     string `gorm:"type:text" json:"response_tail,omitempty"`
+    RequestTruncated bool   `gorm:"not null;default:false" json:"request_truncated"`
+    ResponseTruncated bool  `gorm:"not null;default:false" json:"response_truncated"`
+}
+```
+
+GORM AutoMigrate 加列；旧 row 新列为 NULL / `false`。
+
+**`internal/probe/runner.go：Result`**：
+
+```go
+type Result struct {
+    // ... 原有 13 字段 ...
+    RequestID         string
+    RequestBody       []byte
+    ResponseHead      []byte
+    ResponseTail      []byte
+    ResponseTruncated bool
+    RequestTruncated  bool
+}
+```
+
+`Run()` 在 chunk 循环 `for chunk := range stream.Chunks()` 退出后：
+
+```go
+res.RequestID   = stream.RequestID()
+res.RequestBody = stream.RequestBody()
+res.ResponseHead, res.ResponseTail, res.ResponseTruncated = stream.ResponseSnapshot()
+// Request 已经在 adapter 端按 DefaultRequestCapture 截断；这里只标 flag
+res.RequestTruncated = len(res.RequestBody) >= protocol.DefaultRequestCapture
+```
+
+#### 18.13.5 新增 helper：`internal/protocol/respcap.go`
+
+HAR 风格响应 capture。`io.TeeReader` 把 HTTP body 同时写到 capture 和 scanner：
+
+```go
+type RespCapture struct {
+    headCap, tailCap int
+    head  []byte           // first N bytes verbatim
+    tail  []byte           // last M bytes via sliding-window slice
+    total int              // total bytes observed
+}
+
+func (r *RespCapture) Write(p []byte) (int, error) // implements io.Writer
+func (r *RespCapture) Snapshot() (head, tail []byte, truncated bool)
+
+func TruncateRequest(body []byte, max int) (out []byte, truncated bool)
+```
+
+`DefaultRespHeadCapture = 4096`、`DefaultRespTailCapture = 4096`、`DefaultRequestCapture = 32*1024`。
+
+#### 18.13.6 前端：`RunRow.vue` + `api/runs.ts`
+
+- `web/src/api/runs.ts`：`ProbeRun` 接口加 6 字段（含 `request_truncated` / `response_truncated`）
+- `web/src/components/runs/RunRow.vue`：error 行下方新增「Wire capture」折叠 section
+  - 顶部 toggle 按钮带 X-Req-Id 前 8 字符作为摘要；点开显示 X-Req-Id、request body、response head、response tail 共 4 行
+  - 每行带 ⌘C 复制按钮
+  - 截断时琥珀色 note：「请求体超过 32 KiB，已截断」 / 「响应中部字节被丢弃（保留 head + tail 各 4 KiB）」
+  - 沿用现有 Industrial Utilitarian 风格：JetBrains Mono + 等宽数字 + 1px dashed border
+
+#### 18.13.7 接线图（main → proto）
+
+```
+cmd/ai-monitor/main.go
+└── scheduler.Handler: runner.Run(ctx, t) ─► 协议 adapter.Probe(ctx, cfg) ─► stream
+                                                                              ├─ stream.RequestID()   ─► Result.RequestID
+                                                                              ├─ stream.RequestBody() ─► Result.RequestBody
+                                                                              └─ stream.ResponseSnapshot() ─► Result.Response{Head,Tail,Truncated}
+                                                                                  ▲
+                                                                                  │ tee via io.TeeReader
+                                                                       protocol.NewRespCapture(4K, 4K)
+                                                                            ▲
+                                                                    bytes written to cap
+                                                                            │
+                                                          adapter.consume(s, tapReader, ctx)
+                                                                            └─ tapReader = io.TeeReader(resp.Body, cap)
+```
+
+#### 18.13.8 验收（实施时勾）
+
+- [ ] POST /admin/tasks 创建的任务跑一次，curl `GET /admin/tasks/{id}/runs` → `request_id` 是 uuid v4 格式
+- [ ] 同一 row 的 `response_head` 是 SSE 第一个 `data:` frame，`response_tail` 是 `data: [DONE]` 或最后一行
+- [ ] 故意构造一个 100 KiB request（system_prompt 灌字）→ `request_body` 是首 32 KiB，`request_truncated=true`
+- [ ] 故意构造一个 50 KiB response（streaming mock）→ `response_head` 是首 4 KiB，`response_tail` 是后 4 KiB，`response_truncated=true`
+- [ ] 故意把 X-Req-Id 通过 `openai.extra_headers` 设成自己的格式 → `probe_runs.request_id` 跟 extra_headers 一致（不覆盖失败）
+- [ ] 在浏览器打开 `tasks/{id}/runs`，点开任意一行 → 「Wire capture」section 显示 X-Req-Id + JSON，复制按钮可一键 copy
+- [ ] AutoMigrate 启动后，老 row 的新字段都是 NULL / false（无破坏）
+- [ ] 单测：`TestRunner_ProbeCapturesWireBytes` + `TestRunner_ProbeCaptureMarksTruncation` PASS
+- [ ] `go vet ./...` 干净
+- [ ] 前端 type check / build 干净
+
+#### 18.13.9 不在范围内（留 P2）
+
+- response body 完整存储（不管多大）
+- 请求 body / 响应 body 解码后结构化展示（突出 message / tool_calls 等 JSON path）
+- 按 X-Req-Id 跨任务关联追踪
+- 「按上游 trace id 反查 ai-monitor run」端点：`GET /admin/runs/by-request-id/{id}`
+- 自动 mask：response body 含疑似 secret 字符串（如长 base64 / 数字 API key shape）时部分打码
+- 抓 raw HTTP headers（含 OpenAI 路由 metadata）
+
+---
+
 
 ## A.1 sequence-diagram.mermaid
 

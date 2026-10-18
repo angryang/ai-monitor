@@ -15,14 +15,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aibench/aibench/ai-monitor/internal/config"
-	"github.com/aibench/aibench/ai-monitor/internal/protocol"
+	"github.com/angryang/ai-monitor/internal/config"
+	"github.com/angryang/ai-monitor/internal/protocol"
 )
 
 // Adapter is the Anthropic adapter.
 type Adapter struct {
 	ua   string
 	http *http.Client
+	rid  func() string
 }
 
 // NewAdapter constructs an Anthropic adapter.
@@ -34,7 +35,7 @@ func NewAdapter(deps protocol.AdapterDeps) protocol.ChatProtocolAdapter {
 	if ua == "" {
 		ua = "ai-monitor/1.0 (+anthropic)"
 	}
-	return &Adapter{ua: ua, http: deps.HTTPClient}
+	return &Adapter{ua: ua, http: deps.HTTPClient, rid: deps.RequestIDGenerator}
 }
 
 // Name returns the protocol name.
@@ -69,6 +70,24 @@ type stream struct {
 	closed bool
 	body   io.ReadCloser
 	once   sync.Once
+	// §18.13 — captured for probe_runs persistence.
+	requestID   string
+	requestBody []byte
+	respCapture *protocol.RespCapture
+}
+
+// RequestID returns the X-Req-Id used on the outbound request.
+func (s *stream) RequestID() string { return s.requestID }
+
+// RequestBody returns the raw JSON body posted to upstream.
+func (s *stream) RequestBody() []byte { return s.requestBody }
+
+// ResponseSnapshot returns the bounded first/last bytes of the response body.
+func (s *stream) ResponseSnapshot() (head, tail []byte, truncated bool) {
+	if s.respCapture == nil {
+		return nil, nil, false
+	}
+	return s.respCapture.Snapshot()
 }
 
 // Chunks returns the read channel.
@@ -107,6 +126,8 @@ func (a *Adapter) Probe(ctx context.Context, cfg *config.TaskConfig) (protocol.P
 	if err != nil {
 		return nil, fmt.Errorf("anthropic: marshal request: %w: %w", err, protocol.ErrProtocolCfg)
 	}
+	// §18.13 — clone for probe_runs persistence.
+	savedBody, reqTruncated := protocol.TruncateRequest(body, protocol.DefaultRequestCapture)
 	streamPath, err := joinURL(cfg.BaseURL, "/v1/messages")
 	if err != nil {
 		return nil, fmt.Errorf("anthropic: %w: %w", err, protocol.ErrProtocolCfg)
@@ -122,6 +143,8 @@ func (a *Adapter) Probe(ctx context.Context, cfg *config.TaskConfig) (protocol.P
 	req.Header.Set("anthropic-version", "2023-06-01")
 	req.Header.Set("User-Agent", a.ua)
 	req.Header.Set("Accept", "text/event-stream")
+	// Auto-generated X-Req-Id (user value via extra_headers below wins).
+	rid := protocol.GenerateRequestID(req, a.rid)
 	if cfg.Anthropic != nil {
 		if err := protocol.ApplyExtraHeaders(req, cfg.Anthropic.ExtraHeadersJSON); err != nil {
 			cancel()
@@ -139,12 +162,18 @@ func (a *Adapter) Probe(ctx context.Context, cfg *config.TaskConfig) (protocol.P
 		cancel()
 		return nil, fmt.Errorf("anthropic: status %d: %w", resp.StatusCode, err)
 	}
+	cap := protocol.NewRespCapture(protocol.DefaultRespHeadCapture, protocol.DefaultRespTailCapture)
+	tap := io.TeeReader(resp.Body, cap)
 	s := &stream{
-		ch:     make(chan protocol.Chunk, 32),
-		cancel: cancel,
-		body:   resp.Body,
+		ch:          make(chan protocol.Chunk, 32),
+		cancel:      cancel,
+		body:        resp.Body,
+		requestID:   rid,
+		requestBody: savedBody,
+		respCapture: cap,
 	}
-	go a.consume(s, resp.Body, httpCtx)
+	_ = reqTruncated
+	go a.consume(s, tap, httpCtx)
 	return s, nil
 }
 

@@ -6,7 +6,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aibench/aibench/ai-monitor/internal/config"
+	"github.com/angryang/ai-monitor/internal/config"
 )
 
 // WatchReloader is the public interface of the hot-reload coordinator.

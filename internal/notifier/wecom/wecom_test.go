@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/aibench/aibench/ai-monitor/internal/notifier"
+	"github.com/angryang/ai-monitor/internal/notifier"
 )
 
 func TestWeCom_Send_Success(t *testing.T) {

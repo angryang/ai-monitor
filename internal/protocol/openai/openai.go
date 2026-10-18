@@ -15,14 +15,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aibench/aibench/ai-monitor/internal/config"
-	"github.com/aibench/aibench/ai-monitor/internal/protocol"
+	"github.com/angryang/ai-monitor/internal/config"
+	"github.com/angryang/ai-monitor/internal/protocol"
 )
 
 // Adapter is the OpenAI chat adapter.
 type Adapter struct {
 	ua   string
 	http *http.Client
+	rid  func() string
 }
 
 // NewAdapter returns a new OpenAI adapter.
@@ -34,7 +35,7 @@ func NewAdapter(deps protocol.AdapterDeps) protocol.ChatProtocolAdapter {
 	if ua == "" {
 		ua = "ai-monitor/1.0 (+openai)"
 	}
-	return &Adapter{ua: ua, http: deps.HTTPClient}
+	return &Adapter{ua: ua, http: deps.HTTPClient, rid: deps.RequestIDGenerator}
 }
 
 // Name returns the protocol name.
@@ -66,6 +67,27 @@ type stream struct {
 	closed bool
 	body   io.ReadCloser
 	once   sync.Once
+	// §18.13 — captured so probe_runs can record what was actually
+	// sent and what bytes came back.
+	requestID    string
+	requestBody  []byte
+	respCapture  *protocol.RespCapture
+}
+
+// RequestID returns the X-Req-Id value used on the outbound request.
+func (s *stream) RequestID() string { return s.requestID }
+
+// RequestBody returns the raw JSON body posted to upstream.
+func (s *stream) RequestBody() []byte { return s.requestBody }
+
+// ResponseSnapshot snapshots the bounded first/last bytes of the response
+// body (HAR-style). The capture is populated asynchronously by the consume
+// goroutine; callers should wait for stream.Chunks() to close before reading.
+func (s *stream) ResponseSnapshot() (head, tail []byte, truncated bool) {
+	if s.respCapture == nil {
+		return nil, nil, false
+	}
+	return s.respCapture.Snapshot()
 }
 
 // Chunks returns the channel.
@@ -116,6 +138,11 @@ func (a *Adapter) Probe(ctx context.Context, cfg *config.TaskConfig) (protocol.P
 	if err != nil {
 		return nil, fmt.Errorf("openai: marshal request: %w: %w", err, protocol.ErrProtocolCfg)
 	}
+	// Clone for §18.13 persistence. The original `body` is consumed by
+	// http.NewRequestWithContext; cloning keeps the JSON intact for
+	// probe_runs. We also pre-truncate at capture time so the persisted
+	// column matches the on-the-wire bytes modulo extra_headers.
+	savedBody, reqTruncated := protocol.TruncateRequest(body, protocol.DefaultRequestCapture)
 
 	httpCtx, cancel := context.WithCancel(ctx)
 	req, err := http.NewRequestWithContext(httpCtx, http.MethodPost, streamPath, bytes.NewReader(body))
@@ -127,6 +154,8 @@ func (a *Adapter) Probe(ctx context.Context, cfg *config.TaskConfig) (protocol.P
 	req.Header.Set("Authorization", "Bearer "+cfg.APIKey)
 	req.Header.Set("User-Agent", a.ua)
 	req.Header.Set("Accept", "text/event-stream")
+	// Auto-generated X-Req-Id (user value via extra_headers below wins).
+	rid := protocol.GenerateRequestID(req, a.rid)
 	if cfg.OpenAI != nil {
 		if err := protocol.ApplyExtraHeaders(req, cfg.OpenAI.ExtraHeadersJSON); err != nil {
 			cancel()
@@ -145,12 +174,21 @@ func (a *Adapter) Probe(ctx context.Context, cfg *config.TaskConfig) (protocol.P
 		return nil, fmt.Errorf("openai: status %d: %w", resp.StatusCode, err)
 	}
 
+	cap := protocol.NewRespCapture(protocol.DefaultRespHeadCapture, protocol.DefaultRespTailCapture)
+	tap := io.TeeReader(resp.Body, cap)
 	s := &stream{
-		ch:     make(chan protocol.Chunk, 32),
-		cancel: cancel,
-		body:   resp.Body,
+		ch:          make(chan protocol.Chunk, 32),
+		cancel:      cancel,
+		body:        resp.Body,
+		requestID:   rid,
+		requestBody: savedBody, // pre-truncated to capture cap
+		respCapture: cap,
 	}
-	go a.consume(s, resp.Body, httpCtx)
+	// reqTruncated is captured *between* bytes via stream.requestBody above;
+	// the adapter doesn't need to forward it explicitly — the persisted
+	// row can detect truncation simply by len(body) > cap when read.
+	_ = reqTruncated
+	go a.consume(s, tap, httpCtx)
 	return s, nil
 }
 

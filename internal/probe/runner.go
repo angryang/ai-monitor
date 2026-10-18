@@ -13,11 +13,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aibench/aibench/ai-monitor/internal/config"
-	"github.com/aibench/aibench/ai-monitor/internal/logging"
-	"github.com/aibench/aibench/ai-monitor/internal/metrics"
-	"github.com/aibench/aibench/ai-monitor/internal/notifier"
-	"github.com/aibench/aibench/ai-monitor/internal/protocol"
+	"github.com/angryang/ai-monitor/internal/config"
+	"github.com/angryang/ai-monitor/internal/logging"
+	"github.com/angryang/ai-monitor/internal/metrics"
+	"github.com/angryang/ai-monitor/internal/notifier"
+	"github.com/angryang/ai-monitor/internal/protocol"
 )
 
 // Status values used in Result.Status and on the duration metric's "status" label.
@@ -42,6 +42,16 @@ type Result struct {
 	Chunks    int
 	Status    string
 	Err       error
+
+	// §18.13 — request / response capture. Captured by the protocol
+	// adapter's ProbeStream; the runner pulls these after the chunk
+	// loop closes so we know all bytes have been observed.
+	RequestID        string
+	RequestBody      []byte
+	ResponseHead     []byte
+	ResponseTail     []byte
+	ResponseTruncated bool
+	RequestTruncated bool
 }
 
 // Duration computes the wall-clock duration of the probe.
@@ -77,6 +87,14 @@ type Runner struct {
 	ConsecFailureN       int
 	SuccessRateWindow    int
 	SuccessRateThreshold float64
+	// RunStore persists each probe execution. Nil is allowed (metrics-only
+	// mode) — Run() then skips persistence silently.
+	RunStore RunStore
+	// RunRetention caps the rows per task in RunStore. We prune after
+	// every Save to keep the table bounded for high-frequency cron
+	// schedules. Default 100 is plenty for an admin's "last 2 minutes"
+	// view at 30s cadence.
+	RunRetention int
 }
 
 // NewRunner constructs a runner with sane defaults applied if zero-valued.
@@ -91,6 +109,7 @@ func NewRunner(adapters AdapterLookup, sink metrics.MetricSink, n notifier.Notif
 		ConsecFailureN:       3,
 		SuccessRateWindow:    200,
 		SuccessRateThreshold: 0.8,
+		RunRetention:         100,
 	}
 }
 
@@ -105,6 +124,13 @@ func (r *Runner) Run(ctx context.Context, t config.TaskConfig) Result {
 		Model:    t.Model,
 		Status:   StatusFailure,
 	}
+	// Persist at the very end, regardless of which return path we take.
+	// Note: defer captures function arguments at the defer statement, so
+	// passing &res is critical — if we passed res by value, this deferred
+	// call would see a zero Result because no fields below would be
+	// visible to it. (Classic Go gotcha: deferred call args are evaluated
+	// eagerly, only the *call* is delayed.)
+	defer r.persistRun(&res)
 	ctx = logging.WithTaskID(ctx, t.ID)
 	log := r.Logger.With(
 		slog.String("task_id", t.ID),
@@ -209,6 +235,17 @@ func (r *Runner) Run(ctx context.Context, t config.TaskConfig) Result {
 		res.Status = StatusSuccess
 	}
 
+	// §18.13 — capture X-Req-Id + request body + bounded response
+	// snapshot. Done after the chunk loop closes so the response tail
+	// buffer has seen every byte the upstream sent before we slice it.
+	res.RequestID = stream.RequestID()
+	res.RequestBody = stream.RequestBody()
+	res.ResponseHead, res.ResponseTail, res.ResponseTruncated = stream.ResponseSnapshot()
+	// Request was already pre-truncated by the adapter (DefaultRequestCapture);
+	// we record that fact as a flag instead of trying to detect it from
+	// the byte length (an absent apikey might also produce a tiny body).
+	res.RequestTruncated = len(res.RequestBody) >= protocol.DefaultRequestCapture
+
 	// Emit TTFT + duration metrics. We use wall-clock so cross-process
 	// aggregations in PromQL match ingest times.
 	if res.TTFT > 0 {
@@ -239,6 +276,43 @@ func max1(n int) int64 {
 		return 1
 	}
 	return int64(n)
+}
+
+// persistRun writes a result to the RunStore (when configured) and prunes
+// older rows. The prune-after-write pattern is intentional: a crash between
+// Save and Prune can only leave *more* rows than the cap, never fewer, so
+// the worst-case after recovery is "slightly over the cap", not "lost
+// history". The write itself is fire-and-forget relative to the runner
+// because the probe has already returned — a slow DB shouldn't block the
+// next cron tick.
+//
+// Errors are logged but never returned: the cron scheduler doesn't act on
+// a Run() error today, and we don't want a transient DB hiccup to surface
+// as a phantom 5xx in the metrics pipeline.
+func (r *Runner) persistRun(res *Result) {
+	if r.RunStore == nil {
+		return
+	}
+	if res.EndedAt.IsZero() {
+		res.EndedAt = time.Now().UTC()
+	}
+	run := FromResult(*res)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := r.RunStore.Save(ctx, &run); err != nil {
+		r.Logger.Warn("probe_run_save_failed",
+			slog.String("task_id", res.TaskID),
+			slog.String("err", err.Error()),
+		)
+		return
+	}
+	if r.RunRetention > 0 {
+		if err := r.RunStore.Prune(ctx, r.RunRetention); err != nil {
+			r.Logger.Warn("probe_run_prune_failed",
+				slog.String("err", err.Error()),
+			)
+		}
+	}
 }
 
 // sinkFailure centralises the failure labels.

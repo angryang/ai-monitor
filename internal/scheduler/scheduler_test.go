@@ -3,12 +3,14 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"reflect"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
-	"github.com/aibench/aibench/ai-monitor/internal/config"
+	"github.com/angryang/ai-monitor/internal/config"
 )
 
 func TestScheduler_AddRemove(t *testing.T) {
@@ -153,5 +155,75 @@ func TestScheduler_JitterApplied(t *testing.T) {
 	_ = s.Stop(context.Background())
 	if called.Load() < 1 {
 		t.Fatalf("expected at least one fire; got %d", called.Load())
+	}
+}
+
+func TestScheduler_Add_DisabledIsNoOp(t *testing.T) {
+	var fired atomic.Int32
+	s := New(Options{
+		MaxConcurrent: 1,
+		Handler: func(_ context.Context, _ config.TaskConfig) {
+			fired.Add(1)
+		},
+	})
+	// Enabled=false → Add silently returns nil; the task must NEVER fire.
+	if err := s.Add(config.TaskConfig{ID: "off", Schedule: "@every 50ms", Enabled: false}); err != nil {
+		t.Fatalf("Add disabled: %v", err)
+	}
+	if err := s.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+	_ = s.Stop(context.Background())
+	if fired.Load() != 0 {
+		t.Fatalf("disabled task fired %d times; want 0", fired.Load())
+	}
+}
+
+func TestScheduler_Reload_DisabledSkipped(t *testing.T) {
+	s := New(Options{
+		MaxConcurrent: 4,
+		Handler:       func(_ context.Context, _ config.TaskConfig) {},
+	})
+	tasks := []config.TaskConfig{
+		{ID: "on", Schedule: "@every 50ms", Enabled: true},
+		{ID: "off", Schedule: "@every 50ms", Enabled: false},
+		{ID: "also-off", Schedule: "@every 50ms", Enabled: false},
+	}
+	if err := s.Reload(context.Background(), tasks); err != nil {
+		t.Fatalf("Reload: %v", err)
+	}
+	cs := s.(*cronScheduler)
+	ids := cs.entryIDs()
+	sort.Strings(ids)
+	want := []string{"on"}
+	if !reflect.DeepEqual(ids, want) {
+		t.Fatalf("entryIDs() = %v, want %v", ids, want)
+	}
+}
+
+func TestScheduler_Reload_DisablingActiveRetracts(t *testing.T) {
+	s := New(Options{
+		MaxConcurrent: 4,
+		Handler:       func(_ context.Context, _ config.TaskConfig) {},
+	})
+	// Step 1: enabled.
+	if err := s.Reload(context.Background(), []config.TaskConfig{
+		{ID: "alpha", Schedule: "@every 50ms", Enabled: true},
+	}); err != nil {
+		t.Fatalf("Reload step1: %v", err)
+	}
+	cs := s.(*cronScheduler)
+	if got := cs.entryIDs(); len(got) != 1 || got[0] != "alpha" {
+		t.Fatalf("step1 entryIDs() = %v, want [alpha]", got)
+	}
+	// Step 2: flip to disabled.
+	if err := s.Reload(context.Background(), []config.TaskConfig{
+		{ID: "alpha", Schedule: "@every 50ms", Enabled: false},
+	}); err != nil {
+		t.Fatalf("Reload step2: %v", err)
+	}
+	if got := cs.entryIDs(); len(got) != 0 {
+		t.Fatalf("step2 entryIDs() = %v, want [] (disabled task should be retracted)", got)
 	}
 }
