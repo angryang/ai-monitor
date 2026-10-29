@@ -6,8 +6,10 @@ package probe
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -60,6 +62,8 @@ type memStream struct {
 	respHead  []byte
 	respTail  []byte
 	truncated bool
+	// §18.14 — semantic content the stub pretends to have captured.
+	capture protocol.ContentCapture
 }
 
 func (m *memStream) Chunks() <-chan protocol.Chunk { return m.ch }
@@ -70,6 +74,7 @@ func (m *memStream) RequestBody() []byte           { return m.reqBody }
 func (m *memStream) ResponseSnapshot() (head, tail []byte, truncated bool) {
 	return m.respHead, m.respTail, m.truncated
 }
+func (m *memStream) ContentCapture() protocol.ContentCapture { return m.capture }
 
 type capturingNotifier struct {
 	mu  sync.Mutex
@@ -103,7 +108,21 @@ func (c *captureAdapter) Probe(_ context.Context, cfg *config.TaskConfig) (proto
 	if c.cfgHook != nil {
 		c.cfgHook(cfg)
 	}
-	ch := make(chan protocol.Chunk, 1)
+	if c.err != nil {
+		return nil, c.err
+	}
+	// Mirror stubAdapter's chunk plumbing so tests can supply both a
+	// chunk list and a captured-stream override.
+	ch := make(chan protocol.Chunk, len(c.chunks)+1)
+	for _, chunk := range c.chunks {
+		if chunk.IsFinal {
+			close(ch)
+			m := *c.memOverride
+			m.ch = ch
+			return &m, nil
+		}
+		ch <- chunk
+	}
 	ch <- c.final
 	close(ch)
 	m := *c.memOverride // copy so each probe gets fresh struct
@@ -428,3 +447,121 @@ func (f *flippableAdapter) Probe(_ context.Context, _ *config.TaskConfig) (proto
 
 // defaultLogForTest is a no-op JSON logger for tests.
 func defaultLogForTest() (l *slog.Logger) { return slog.New(slog.NewJSONHandler(io.Discard, nil)) }
+
+// TestRunner_ProbePersistsSemanticContent verifies §18.14 end-to-end:
+// input / thinking / output are captured on the Result and land in the
+// persisted ProbeRun row.
+func TestRunner_ProbePersistsSemanticContent(t *testing.T) {
+	captured := &memStream{
+		requestID: "rid-content-001",
+		capture: protocol.ContentCapture{
+			ThinkingContent: "先推理一下",
+		},
+	}
+	adapter := &captureAdapter{
+		stubAdapter: stubAdapter{
+			name: "openai",
+			chunks: []protocol.Chunk{
+				{Delta: "答案", ArrivedAt: time.Now().UTC()},
+				{Delta: "！", ArrivedAt: time.Now().UTC()},
+			},
+			final: protocol.Chunk{Delta: "", ArrivedAt: time.Now().UTC(), IsFinal: true},
+		},
+		memOverride: captured,
+	}
+	sink := metrics.NewPromSink(metrics.PrometheusOptions{})
+	runStore := &memRunStore{}
+	r := NewRunner(func(name string) (RunnerAdapter, error) { return adapter, nil }, sink, nil, notifier.NewDeduper(time.Minute))
+	r.Logger = defaultLogForTest()
+	r.RunStore = runStore
+
+	task := config.TaskConfig{
+		ID: "c", Name: "c", Protocol: config.ProtocolOpenAI, Enabled: true,
+		BaseURL: "https://e.test", Model: "x",
+		SystemPrompt: "你是助手", UserPrompt: "你好",
+		Schedule: "@every 1m",
+	}
+	res := r.Run(context.Background(), task)
+
+	if !strings.Contains(res.InputContent, "[system]\n你是助手") {
+		t.Fatalf("InputContent = %q", res.InputContent)
+	}
+	if !strings.Contains(res.InputContent, "[user]\n你好") {
+		t.Fatalf("InputContent = %q", res.InputContent)
+	}
+	if res.ThinkingContent != "先推理一下" {
+		t.Fatalf("ThinkingContent = %q", res.ThinkingContent)
+	}
+	if res.OutputContent != "答案！" {
+		t.Fatalf("OutputContent = %q", res.OutputContent)
+	}
+
+	row := FromResult(res)
+	if row.InputContent != res.InputContent {
+		t.Fatalf("row.InputContent = %q", row.InputContent)
+	}
+	if row.ThinkingContent != res.ThinkingContent {
+		t.Fatalf("row.ThinkingContent = %q", row.ThinkingContent)
+	}
+	if row.OutputContent != res.OutputContent {
+		t.Fatalf("row.OutputContent = %q", row.OutputContent)
+	}
+
+	// The runner writes the row to the store; verify the persisted shape.
+	runStore.mu.Lock()
+	defer runStore.mu.Unlock()
+	if len(runStore.runs) != 1 {
+		t.Fatalf("expected 1 persisted run, got %d", len(runStore.runs))
+	}
+	got := runStore.runs[0]
+	if got.OutputContent != "答案！" {
+		t.Fatalf("persisted OutputContent = %q", got.OutputContent)
+	}
+	if got.ThinkingContent != "先推理一下" {
+		t.Fatalf("persisted ThinkingContent = %q", got.ThinkingContent)
+	}
+}
+
+// TestRunner_ProbeFailureKeepsRequestID verifies §18.14: a failed probe
+// must still record the X-Req-Id and the upstream error body, otherwise
+// the most interesting failures leave no trace to chase.
+func TestRunner_ProbeFailureKeepsRequestID(t *testing.T) {
+	reqErr := protocol.NewRequestError(
+		"rid-fail-401",
+		[]byte(`{"model":"x"}`),
+		`{"error":{"message":"Incorrect API key provided"}}`,
+		fmt.Errorf("openai: status 401: %w", protocol.ErrUnauthorized),
+	)
+	adapter := &stubAdapter{name: "openai", err: reqErr}
+	sink := metrics.NewPromSink(metrics.PrometheusOptions{})
+	runStore := &memRunStore{}
+	r := NewRunner(func(name string) (RunnerAdapter, error) { return adapter, nil }, sink, nil, notifier.NewDeduper(time.Minute))
+	r.Logger = defaultLogForTest()
+	r.RunStore = runStore
+
+	task := config.TaskConfig{ID: "f", Name: "f", Protocol: config.ProtocolOpenAI, Enabled: true, BaseURL: "https://e.test", Model: "x", UserPrompt: "hi", Schedule: "@every 1m"}
+	res := r.Run(context.Background(), task)
+
+	if res.Status != StatusUnauthorized {
+		t.Fatalf("Status = %q, want %q", res.Status, StatusUnauthorized)
+	}
+	if res.RequestID != "rid-fail-401" {
+		t.Fatalf("RequestID = %q, want rid-fail-401", res.RequestID)
+	}
+	if !strings.Contains(res.ResponseErrorBody, "Incorrect API key") {
+		t.Fatalf("ResponseErrorBody = %q", res.ResponseErrorBody)
+	}
+	// Input is captured even when the request itself fails.
+	if !strings.Contains(res.InputContent, "hi") {
+		t.Fatalf("InputContent = %q", res.InputContent)
+	}
+
+	runStore.mu.Lock()
+	defer runStore.mu.Unlock()
+	if len(runStore.runs) != 1 {
+		t.Fatalf("expected 1 persisted run, got %d", len(runStore.runs))
+	}
+	if runStore.runs[0].RequestID != "rid-fail-401" {
+		t.Fatalf("persisted RequestID = %q", runStore.runs[0].RequestID)
+	}
+}

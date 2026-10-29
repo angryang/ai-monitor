@@ -83,6 +83,90 @@ func TestTaskConfig_RoundTrip(t *testing.T) {
 	}
 }
 
+// TestTaskConfig_InsecureSkipVerifyRoundTrip pins the TLS switch to the
+// DB — a task that opts out of certificate verification must survive a
+// restart, otherwise the probe silently reverts to verifying and starts
+// failing again with an x509 error.
+func TestTaskConfig_InsecureSkipVerifyRoundTrip(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	tc := sampleOpenAI("t-1", "self-signed-upstream")
+	tc.InsecureSkipVerify = true
+	if err := store.CreateTask(ctx, tc); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	got, err := store.GetTask(ctx, "t-1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !got.InsecureSkipVerify {
+		t.Fatalf("insecure_skip_verify was lost on read")
+	}
+
+	// Flipping it back off must persist too.
+	got.InsecureSkipVerify = false
+	if err := store.UpdateTask(ctx, got); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	after, err := store.GetTask(ctx, "t-1")
+	if err != nil {
+		t.Fatalf("get after update: %v", err)
+	}
+	if after.InsecureSkipVerify {
+		t.Fatalf("insecure_skip_verify should be false after the update")
+	}
+}
+
+// TestTaskConfig_InsecureSkipVerifyDefaultsToFalse guards the safe
+// default: verification stays on unless someone explicitly opts out.
+func TestTaskConfig_InsecureSkipVerifyDefaultsToFalse(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	tc := sampleOpenAI("t-1", "default-tls")
+	if err := store.CreateTask(ctx, tc); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	got, err := store.GetTask(ctx, "t-1")
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.InsecureSkipVerify {
+		t.Fatalf("insecure_skip_verify must default to false")
+	}
+}
+
+// TestFingerprint_DetectsInsecureSkipVerifyChange ensures the hot-reload
+// watcher notices a flipped TLS switch. Without the column in the
+// fingerprint, flipping the flag in the admin UI would silently not take
+// effect until the process restarts.
+func TestFingerprint_DetectsInsecureSkipVerifyChange(t *testing.T) {
+	store := newTestStore(t)
+	ctx := context.Background()
+
+	tc := sampleOpenAI("t-1", "fingerprint-tls")
+	if err := store.CreateTask(ctx, tc); err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	before, err := store.fingerprintAll(ctx)
+	if err != nil {
+		t.Fatalf("fingerprint: %v", err)
+	}
+
+	tc.InsecureSkipVerify = true
+	if err := store.UpdateTask(ctx, tc); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	after, err := store.fingerprintAll(ctx)
+	if err != nil {
+		t.Fatalf("fingerprint: %v", err)
+	}
+	if before["t-1"] == after["t-1"] {
+		t.Fatalf("the fingerprint must change when insecure_skip_verify flips")
+	}
+}
+
 func TestCreateTask_UniqueName(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()

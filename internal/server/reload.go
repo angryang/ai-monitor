@@ -93,7 +93,7 @@ func (r *relCoordinator) applyEvent(ctx context.Context, ev config.Event) {
 	t0 := time.Now()
 	listCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	tasks, err := r.store.ListTasks(listCtx)
+	tasks, err := r.listTasks(listCtx)
 	if err != nil {
 		r.log.Warn("reload_list_failed",
 			slog.String("event", string(ev.Type)),
@@ -114,6 +114,27 @@ func (r *relCoordinator) applyEvent(ctx context.Context, ev config.Event) {
 		slog.Int("task_count", len(tasks)),
 		slog.Int64("duration_ms", time.Since(t0).Milliseconds()),
 	)
+}
+
+// listTasks prefers the lenient variant when the store supports it, so a
+// single undecryptable row doesn't block config hot reload for every other
+// task.
+//
+// A failure of the listing itself is returned as an error so the caller
+// skips the reload instead of applying an empty task list — the latter
+// would unschedule every probe in the instance.
+func (r *relCoordinator) listTasks(ctx context.Context) ([]config.TaskConfig, error) {
+	if ll, ok := r.store.(config.LenientTaskLister); ok {
+		tasks, errs, err := ll.ListTasksLenient(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, err := range errs {
+			r.log.Warn("reload_task_secret_decrypt_failed", slog.String("err", err.Error()))
+		}
+		return tasks, nil
+	}
+	return r.store.ListTasks(ctx)
 }
 
 // Stop terminates the run loop.

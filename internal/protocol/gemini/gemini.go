@@ -26,6 +26,9 @@ type Adapter struct {
 	ua   string
 	http *http.Client
 	rid  func() string
+	// insecureSkipVerify mirrors deps.InsecureSkipVerify — the instance-wide
+	// "don't verify upstream certs" switch.
+	insecureSkipVerify bool
 }
 
 // NewAdapter constructs a Gemini adapter.
@@ -37,7 +40,12 @@ func NewAdapter(deps protocol.AdapterDeps) protocol.ChatProtocolAdapter {
 	if ua == "" {
 		ua = "ai-monitor/1.0 (+gemini)"
 	}
-	return &Adapter{ua: ua, http: deps.HTTPClient, rid: deps.RequestIDGenerator}
+	return &Adapter{
+		ua:                 ua,
+		http:               deps.HTTPClient,
+		rid:                deps.RequestIDGenerator,
+		insecureSkipVerify: deps.InsecureSkipVerify,
+	}
 }
 
 // Name returns the protocol name.
@@ -73,6 +81,8 @@ type stream struct {
 	requestID   string
 	requestBody []byte
 	respCapture *protocol.RespCapture
+	// §18.14 — reasoning content accumulated while consuming the stream.
+	thinking *protocol.TextAccumulator
 }
 
 // RequestID returns the X-Req-Id used on the outbound request.
@@ -87,6 +97,14 @@ func (s *stream) ResponseSnapshot() (head, tail []byte, truncated bool) {
 		return nil, nil, false
 	}
 	return s.respCapture.Snapshot()
+}
+
+// ContentCapture returns the reasoning content seen so far (§18.14).
+func (s *stream) ContentCapture() protocol.ContentCapture {
+	return protocol.ContentCapture{
+		ThinkingContent: s.thinking.String(),
+		Truncated:       s.thinking.Truncated(),
+	}
 }
 
 // Chunks returns the channel.
@@ -152,15 +170,21 @@ func (a *Adapter) Probe(ctx context.Context, cfg *config.TaskConfig) (protocol.P
 		}
 	}
 
-	resp, err := a.http.Do(req)
+	resp, err := protocol.ClientFor(a.http, a.insecureSkipVerify, cfg).Do(req)
 	if err != nil {
 		cancel()
-		return nil, fmt.Errorf("gemini: do: %w: %w", err, protocol.ErrUpstreamDown)
+		// §18.14 — keep the X-Req-Id attached to the failure so admins can
+		// grep the upstream logs for this exact attempt.
+		return nil, protocol.NewRequestError(rid, savedBody, "",
+			fmt.Errorf("gemini: do: %w: %w", err, protocol.ErrUpstreamDown))
 	}
-	if err := protocol.ClassifyHTTPStatus(resp.StatusCode); err != nil {
+	if cerr := protocol.ClassifyHTTPStatus(resp.StatusCode); cerr != nil {
+		// §18.14 — the 4xx/5xx body usually says exactly what went wrong.
+		errBody := protocol.ReadErrorBody(resp.Body, protocol.DefaultErrorBodyCapture)
 		_ = resp.Body.Close()
 		cancel()
-		return nil, fmt.Errorf("gemini: status %d: %w", resp.StatusCode, err)
+		return nil, protocol.NewRequestError(rid, savedBody, errBody,
+			fmt.Errorf("gemini: status %d: %w", resp.StatusCode, cerr))
 	}
 	cap := protocol.NewRespCapture(protocol.DefaultRespHeadCapture, protocol.DefaultRespTailCapture)
 	tap := io.TeeReader(resp.Body, cap)
@@ -171,6 +195,7 @@ func (a *Adapter) Probe(ctx context.Context, cfg *config.TaskConfig) (protocol.P
 		requestID:   rid,
 		requestBody: savedBody,
 		respCapture: cap,
+		thinking:    protocol.NewTextAccumulator(protocol.DefaultContentCapture),
 	}
 	_ = reqTruncated
 	go a.consume(s, tap, httpCtx)
@@ -252,6 +277,13 @@ func (a *Adapter) parseAndEmit(s *stream, raw string, idx *int, ctx context.Cont
 			if part.Text == "" {
 				continue
 			}
+			// §18.14 — thought parts are the model's reasoning, not the
+			// answer. Route them to the thinking accumulator and keep them
+			// out of the user-facing chunk stream.
+			if part.Thought {
+				s.thinking.WriteString(part.Text)
+				continue
+			}
 			final := cand.FinishReason != ""
 			c := protocol.Chunk{
 				Delta:     part.Text,
@@ -297,11 +329,15 @@ func (s *stream) setErr(err error) {
 }
 
 // geminiFrame mirrors the relevant subset of the Gemini response payload.
+//
+// §18.14 — a part with "thought": true is the model's reasoning, not the
+// answer. Gemini reports thought parts inline in the same parts array.
 type geminiFrame struct {
 	Candidates []struct {
 		Content struct {
 			Parts []struct {
-				Text string `json:"text"`
+				Text    string `json:"text"`
+				Thought bool   `json:"thought"`
 			} `json:"parts"`
 		} `json:"content"`
 		FinishReason string `json:"finishReason"`
@@ -309,8 +345,25 @@ type geminiFrame struct {
 }
 
 // reqBody is the request payload.
+//
+// GenerationConfig — present only when the task's thinking switch is on;
+// `thinkingConfig.thinkingBudget: -1` asks Gemini 2.5+ for dynamic
+// thinking. Older models that don't know thinkingConfig reject it with a
+// 400, which the run history surfaces verbatim — that's the honest
+// signal that the model doesn't support the switch.
 type reqBody struct {
-	Contents []reqContent `json:"contents"`
+	Contents         []reqContent      `json:"contents"`
+	GenerationConfig *generationConfig `json:"generationConfig,omitempty"`
+}
+
+// generationConfig mirrors the generationConfig request block.
+type generationConfig struct {
+	ThinkingConfig *thinkingConfig `json:"thinkingConfig,omitempty"`
+}
+
+// thinkingConfig controls Gemini's reasoning. thinkingBudget -1 = dynamic.
+type thinkingConfig struct {
+	ThinkingBudget int `json:"thinkingBudget"`
 }
 
 // reqContent represents one turn in the conversation.
@@ -326,8 +379,8 @@ type reqPart struct {
 
 // buildRequest builds the payload.
 func buildRequest(cfg *config.TaskConfig) ([]byte, error) {
-	userPrompt := expandVars(cfg.UserPrompt, cfg.PromptVars)
-	sysPrompt := expandVars(cfg.SystemPrompt, cfg.PromptVars)
+	userPrompt := protocol.ExpandVars(cfg.UserPrompt, cfg.PromptVars)
+	sysPrompt := protocol.ExpandVars(cfg.SystemPrompt, cfg.PromptVars)
 	parts := []reqPart{{Text: userPrompt}}
 	if sysPrompt != "" {
 		parts = append([]reqPart{{Text: sysPrompt}}, parts...)
@@ -335,18 +388,12 @@ func buildRequest(cfg *config.TaskConfig) ([]byte, error) {
 	body := reqBody{
 		Contents: []reqContent{{Role: "user", Parts: parts}},
 	}
+	if cfg.ThinkingEnabled {
+		body.GenerationConfig = &generationConfig{
+			ThinkingConfig: &thinkingConfig{ThinkingBudget: -1},
+		}
+	}
 	return json.Marshal(body)
-}
-
-func expandVars(s string, vars map[string]string) string {
-	if len(vars) == 0 {
-		return s
-	}
-	out := s
-	for k, v := range vars {
-		out = strings.ReplaceAll(out, "${"+k+"}", v)
-	}
-	return out
 }
 
 func joinURL(base, path string) (string, error) {

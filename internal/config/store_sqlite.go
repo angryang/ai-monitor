@@ -91,6 +91,10 @@ func (s *SqliteStore) cipherOrNil() Cipher {
 
 // ListTasks returns every row in the table. Refreshes the runtime-only JSON
 // columns on the way out.
+//
+// Strict: the first row whose secrets cannot be decrypted aborts the whole
+// call. Use ListTasksLenient on the startup path, where one broken row must
+// not take the service down.
 func (s *SqliteStore) ListTasks(ctx context.Context) ([]TaskConfig, error) {
 	var rows []TaskConfig
 	if err := s.db.WithContext(ctx).Order("created_at ASC").Find(&rows).Error; err != nil {
@@ -107,6 +111,50 @@ func (s *SqliteStore) ListTasks(ctx context.Context) ([]TaskConfig, error) {
 	return rows, nil
 }
 
+// ListTasksLenient loads every task, keeping rows whose encrypted secrets
+// cannot be opened instead of aborting the whole listing.
+//
+// Why: a master key mismatch (rotated key, DB copied from another instance)
+// used to make the service die at startup with a bare "cipher: message
+// authentication failed", leaving no way to reach the admin UI and repair
+// the task. Here the affected row is still returned — with SecretError set
+// and the secrets left empty — so the operator can re-enter the api key.
+//
+// The second return value carries one entry per task whose secrets failed
+// to decrypt; the caller is expected to log them loudly.
+//
+// The third return value is reserved for failures of the listing itself
+// (unreachable database, a row whose persisted JSON cannot be decoded).
+// It is deliberately distinct from the per-row errors: a caller that
+// conflates the two ends up treating "the query failed" as "there are no
+// tasks", which makes every task disappear from the admin UI without any
+// error being surfaced.
+func (s *SqliteStore) ListTasksLenient(ctx context.Context) ([]TaskConfig, []error, error) {
+	var rows []TaskConfig
+	if err := s.db.WithContext(ctx).Order("created_at ASC").Find(&rows).Error; err != nil {
+		return nil, nil, fmt.Errorf("config: list: %w", err)
+	}
+	out := make([]TaskConfig, 0, len(rows))
+	var secretErrs []error
+	for i := range rows {
+		row := rows[i]
+		if err := decodeJSONColumns(&row); err != nil {
+			return nil, nil, fmt.Errorf("config: task %q: %w", row.Name, err)
+		}
+		if err := s.decodeSecrets(&row); err != nil {
+			// Keep the row: its non-secret fields (base_url, model,
+			// schedule, …) are still valid and re-entering the api key
+			// makes the task work again.
+			row.APIKey = ""
+			row.Notify.WeComWebhook = ""
+			row.SecretError = err.Error()
+			secretErrs = append(secretErrs, fmt.Errorf("config: task %q: %w", row.Name, err))
+		}
+		out = append(out, row)
+	}
+	return out, secretErrs, nil
+}
+
 // GetTask fetches a single task by id.
 func (s *SqliteStore) GetTask(ctx context.Context, id string) (*TaskConfig, error) {
 	var row TaskConfig
@@ -121,6 +169,31 @@ func (s *SqliteStore) GetTask(ctx context.Context, id string) (*TaskConfig, erro
 	}
 	if err := s.decodeSecrets(&row); err != nil {
 		return nil, err
+	}
+	return &row, nil
+}
+
+// GetTaskLenient fetches a single task by id, tolerating secrets that cannot
+// be decrypted.
+//
+// A master key mismatch on one row must not make the task unreachable —
+// otherwise the operator cannot even open the edit form to re-enter the api
+// key. The returned row carries SecretError and empty secrets.
+func (s *SqliteStore) GetTaskLenient(ctx context.Context, id string) (*TaskConfig, error) {
+	var row TaskConfig
+	if err := s.db.WithContext(ctx).Where("id = ?", id).First(&row).Error; err != nil {
+		if errors.Is(err, gorm.ErrRecordNotFound) {
+			return nil, fmt.Errorf("config: %s: %w", id, ErrNotFound)
+		}
+		return nil, fmt.Errorf("config: get %s: %w", id, err)
+	}
+	if err := decodeJSONColumns(&row); err != nil {
+		return nil, err
+	}
+	if err := s.decodeSecrets(&row); err != nil {
+		row.APIKey = ""
+		row.Notify.WeComWebhook = ""
+		row.SecretError = err.Error()
 	}
 	return &row, nil
 }
@@ -330,36 +403,37 @@ func (s *SqliteStore) Watch(ctx context.Context) (<-chan Event, error) {
 // full ciphertext on every tick.
 func (s *SqliteStore) fingerprintAll(ctx context.Context) (map[string]string, error) {
 	type fpRow struct {
-		ID            string
-		Name          string
-		Enabled       bool
-		Protocol      string
-		BaseURL       string
-		APIKeyEnc     []byte
-		Model         string
-		PromptVars    string
-		Schedule      string
-		TimeoutMS     int64
-		CanaryGroup   string
-		NotifyEnabled bool
-		WebhookEnc    []byte
-		OpenAIEnc     string
-		AnthropicEnc  string
-		GeminiEnc     string
+		ID                 string
+		Name               string
+		Enabled            bool
+		Protocol           string
+		BaseURL            string
+		APIKeyEnc          []byte
+		Model              string
+		PromptVars         string
+		Schedule           string
+		TimeoutMS          int64
+		CanaryGroup        string
+		InsecureSkipVerify bool
+		NotifyEnabled      bool
+		WebhookEnc         []byte
+		OpenAIEnc          string
+		AnthropicEnc       string
+		GeminiEnc          string
 	}
 	var rows []fpRow
 	if err := s.db.WithContext(ctx).
 		Table(TaskConfigTableName).
-		Select("id, name, enabled, protocol, base_url, api_key_enc, model, prompt_vars, schedule, timeout_ms, canary_group, enabled as notify_enabled, wecom_webhook_enc as webhook_enc, openai_extra_headers as openai_enc, anthropic_extra_headers as anthropic_enc, gemini_extra_headers as gemini_enc").
+		Select("id, name, enabled, protocol, base_url, api_key_enc, model, prompt_vars, schedule, timeout_ms, canary_group, insecure_skip_verify, enabled as notify_enabled, wecom_webhook_enc as webhook_enc, openai_extra_headers as openai_enc, anthropic_extra_headers as anthropic_enc, gemini_extra_headers as gemini_enc").
 		Scan(&rows).Error; err != nil {
 		return nil, fmt.Errorf("config: fingerprint scan: %w", err)
 	}
 	out := make(map[string]string, len(rows))
 	for _, r := range rows {
-		h := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%t|%s|%s|%x|%s|%s|%s|%d|%s|%t|%x|%s|%s|%s",
+		h := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%t|%s|%s|%x|%s|%s|%s|%d|%s|%t|%t|%x|%s|%s|%s",
 			r.ID, r.Name, r.Enabled, r.Protocol, r.BaseURL, r.APIKeyEnc, r.Model,
-			r.PromptVars, r.Schedule, r.TimeoutMS, r.CanaryGroup, r.NotifyEnabled,
-			r.WebhookEnc, r.OpenAIEnc, r.AnthropicEnc, r.GeminiEnc)))
+			r.PromptVars, r.Schedule, r.TimeoutMS, r.CanaryGroup, r.InsecureSkipVerify,
+			r.NotifyEnabled, r.WebhookEnc, r.OpenAIEnc, r.AnthropicEnc, r.GeminiEnc)))
 		out[r.ID] = hex.EncodeToString(h[:])
 	}
 	return out, nil

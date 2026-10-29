@@ -55,6 +55,18 @@ type Result struct {
 	ResponseTail     []byte
 	ResponseTruncated bool
 	RequestTruncated bool
+
+	// §18.14 — semantic content. InputContent is derived from the task
+	// config (variables already expanded), ThinkingContent comes from the
+	// adapter's in-flight capture, OutputContent is accumulated from the
+	// content chunks.
+	InputContent      string
+	ThinkingContent   string
+	OutputContent     string
+	ContentTruncated  bool
+	// ResponseErrorBody holds the (bounded) body of a failed response.
+	// Empty on success.
+	ResponseErrorBody string
 }
 
 // Duration computes the wall-clock duration of the probe.
@@ -167,10 +179,25 @@ func (r *Runner) Run(ctx context.Context, t config.TaskConfig) Result {
 
 	res.StartedAt = time.Now().UTC()
 
+	// §18.14 — 输入内容由任务配置还原（prompt 变量已展开），与适配器
+	// 实际发出的请求体逐字一致。放在 Probe 之前算：即使请求本身失败，
+	// admin 也需要知道"我们到底发了什么过去"。
+	res.InputContent = protocol.BuildInput(&t)
+
 	stream, err := adapter.Probe(ctx, &t)
 	if err != nil {
 		res.EndedAt = time.Now().UTC()
 		res.Err = fmt.Errorf("probe: %w", err)
+		// §18.14 — 失败路径上同样要留下 X-Req-Id 与错误响应体。
+		// 401 / 403 / 5xx 恰恰是最需要排查的场景，丢了这两个字段就等于
+		// 让 admin 拿着一条 "unauthorized" 记录却无从查起。
+		var reqErr *protocol.RequestError
+		if errors.As(err, &reqErr) {
+			res.RequestID = reqErr.RequestID
+			res.RequestBody = reqErr.RequestBody
+			res.ResponseErrorBody = reqErr.ResponseBody
+			res.RequestTruncated = len(reqErr.RequestBody) >= protocol.DefaultRequestCapture
+		}
 		// Map sentinel errors to status / failure-type labels.
 		switch {
 		case errors.Is(err, protocol.ErrUnauthorized):
@@ -190,6 +217,9 @@ func (r *Runner) Run(ctx context.Context, t config.TaskConfig) Result {
 	}
 	defer stream.Close()
 
+	// §18.14 — 输出内容由 content chunk 累积而成。上限与输入 / 思考一致。
+	outputAcc := protocol.NewTextAccumulator(protocol.DefaultContentCapture)
+
 	for chunk := range stream.Chunks() {
 		if res.Chunks == 0 {
 			res.TTFT = chunk.ArrivedAt.Sub(res.StartedAt)
@@ -207,6 +237,11 @@ func (r *Runner) Run(ctx context.Context, t config.TaskConfig) Result {
 			}
 		}
 		res.Chunks++
+		// §18.14 — 只有面向用户的正文计入输出内容；推理部分由 adapter
+		// 单独累积（见 ContentCapture），不进这里。
+		if chunk.Kind == protocol.ChunkContent {
+			outputAcc.WriteString(chunk.Delta)
+		}
 		// Approximate ITL by averaging across the elapsed time.
 		if res.Chunks > 1 {
 			res.ITLCount++
@@ -248,6 +283,14 @@ func (r *Runner) Run(ctx context.Context, t config.TaskConfig) Result {
 	// we record that fact as a flag instead of trying to detect it from
 	// the byte length (an absent apikey might also produce a tiny body).
 	res.RequestTruncated = len(res.RequestBody) >= protocol.DefaultRequestCapture
+
+	// §18.14 — semantic content. The adapter accumulated the reasoning
+	// trace while the stream was live; the answer text we accumulated
+	// above from the content chunks.
+	capture := stream.ContentCapture()
+	res.ThinkingContent = capture.ThinkingContent
+	res.OutputContent = outputAcc.String()
+	res.ContentTruncated = capture.Truncated || outputAcc.Truncated()
 
 	// Emit TTFT + duration metrics. We use wall-clock so cross-process
 	// aggregations in PromQL match ingest times.

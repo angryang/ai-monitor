@@ -36,6 +36,7 @@ Built per `docs/design.md` (kept in this repo).
 ./scripts/run-local.sh             # 前台；Ctrl+C 退出
 ./scripts/run-local.sh --bg        # 后台，日志 /tmp/ai-monitor.log
 ./scripts/run-local.sh --clean     # 启动前清空 DB（首次启动用）
+./scripts/run-local.sh --rebuild   # 强制重新编译二进制后再启动
 
 # 浏览器：
 #   URL     : http://localhost:9090
@@ -50,6 +51,10 @@ export AI_MONITOR_ADMIN_PASSWORD="LocalAdmin2026!Q"
 export WECOM_WEBHOOK="https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=test"
 ./ai-monitor -config deploy/example.config.yaml
 ```
+
+脚本会在源码变更后自动重新编译（比较源文件与二进制的 mtime），不必手动 `go build`。
+
+未显式设置 `AI_MONITOR_MASTER_KEY` 时，脚本把随机生成的密钥写入仓库根的 `.local-secrets`（已 gitignore，权限 600），后续启动复用同一份。**这份文件决定 DB 里已加密的 api_key 能否解开**——删掉它等于换了主密钥，存量任务的 api_key 将无法解密（服务仍会启动，但那些任务需要在管理端重新填写 API Key）。
 
 服务可用后：
 
@@ -67,6 +72,33 @@ The loader merges defaults → `config.yaml` → `AI_MONITOR_*` env vars → fla
 A starter config is in `deploy/example.config.yaml`. See `internal/config/loader.go`
 for the full key list.
 
+## TLS certificate verification
+
+Some internal endpoints serve a self-signed certificate or one signed by a
+private CA that the host doesn't trust. Probing them fails with:
+
+```text
+probe: openai: do: Post "https://20.20.100.94:18089/v1/chat/completions":
+tls: failed to verify certificate: x509: certificate signed by unknown authority:
+protocol: upstream unavailable.
+```
+
+There are two ways to turn verification off:
+
+| Scope | Where | How |
+|---|---|---|
+| Per task | task config | `insecure_skip_verify: true` in the task, or `PATCH /admin/tasks/{id}` with `{"insecure_skip_verify": true}` |
+| Instance-wide | runtime config | `insecure_skip_verify: true` in `config.yaml`, `AI_MONITOR_INSECURE_SKIP_VERIFY=true`, or `--insecure-skip-verify` |
+
+The two are OR'ed — the instance-wide switch is an explicit "this deployment
+does not verify certificates" decision, so it can't be undone for a single
+task. Prefer the per-task switch: skipping verification removes MITM
+protection, so keep it scoped to endpoints on a trusted network path.
+
+The per-task setting persists in SQLite (the `insecure_skip_verify` column is
+added automatically on startup) and is editable from the admin UI under
+「TLS 证书校验」.
+
 ## Protocols
 
 Three adapters ship in `internal/protocol/*`:
@@ -77,6 +109,28 @@ Three adapters ship in `internal/protocol/*`:
 
 Every adapter supports custom `extra_headers` for canary traffic tests
 (see `deploy/canary-scenarios.yaml`).
+
+## Run history
+
+`GET /admin/tasks/{id}/runs` returns one row per probe execution. Each row
+carries both the raw wire bytes (§18.13) and the parsed semantic content
+(§18.14):
+
+| Field | What it holds |
+|---|---|
+| `request_id` | The `X-Req-Id` sent upstream — **kept even on 401/403/5xx**, so a failed probe can be correlated with the provider's own logs |
+| `input_content` | What was actually sent (system + user, prompt vars already expanded) |
+| `thinking_content` | The model's reasoning trace (DeepSeek/Qwen `reasoning_content`, OpenRouter `reasoning`, Anthropic `thinking_delta`, Gemini thought parts) |
+| `output_content` | The model's answer text |
+| `response_error_body` | The upstream's error body on a failed probe — usually where the actionable detail lives |
+
+Reasoning is captured in the adapter while the stream is live, because it
+cannot be recovered from the bounded head/tail byte capture afterwards.
+Each content field is capped at 16 KiB (`content_truncated` flags
+overflow), truncated on a UTF-8 boundary.
+
+In the UI the X-Req-Id is shown on every row (click to copy), and the
+「内容解析」 section expands into input / thinking / output.
 
 ## Metrics
 

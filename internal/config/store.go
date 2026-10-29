@@ -37,6 +37,40 @@ type ConfigStore interface {
 	Close() error
 }
 
+// LenientTaskLister is an optional extension of ConfigStore implemented by
+// stores that can list tasks even when some rows fail to decrypt.
+//
+// It exists because a master key mismatch (rotated key, DB copied from
+// another instance) would otherwise make ListTasks fail outright and take
+// the whole service down — with no way to reach the admin UI and repair the
+// affected task.
+//
+// Callers use a type assertion, so ConfigStore itself stays unchanged and
+// test doubles don't have to implement the extra method:
+//
+//	if ll, ok := store.(config.LenientTaskLister); ok {
+//	    tasks, secretErrs, err := ll.ListTasksLenient(ctx)
+//	    // secretErrs holds one entry per task whose secrets failed to decrypt
+//	    // err is non-nil only when the listing itself failed
+//	}
+//
+// Those tasks are still returned, with TaskConfig.SecretError set and the
+// secrets left empty.
+//
+// The third return value separates "some rows are broken" (secretErrs, the
+// listing is still usable) from "the listing failed" (err). Callers MUST
+// propagate err instead of continuing with an empty task list: an empty
+// list is indistinguishable from "the user has no tasks", so swallowing the
+// error makes every task look like it silently vanished.
+type LenientTaskLister interface {
+	ListTasksLenient(ctx context.Context) ([]TaskConfig, []error, error)
+}
+
+// LenientTaskGetter is the single-row counterpart of LenientTaskLister.
+type LenientTaskGetter interface {
+	GetTaskLenient(ctx context.Context, id string) (*TaskConfig, error)
+}
+
 // Sentinel errors returned by ConfigStore implementations. Callers MUST
 // use errors.Is/As to match them.
 var (

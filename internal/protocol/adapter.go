@@ -30,7 +30,25 @@ type Chunk struct {
 	ArrivedAt time.Time
 	Index     int
 	IsFinal   bool
+	// Kind distinguishes the model's reasoning trace from the answer text.
+	// §18.14 — adapters emit reasoning as ChunkThinking so the runner can
+	// persist it separately. The zero value is ChunkContent, which keeps
+	// every pre-existing producer (and test fixture) correct.
+	Kind ChunkKind
 }
+
+// ChunkKind classifies what a streamed fragment carries.
+type ChunkKind uint8
+
+const (
+	// ChunkContent is the answer text destined for the user.
+	ChunkContent ChunkKind = iota
+	// ChunkThinking is the model's intermediate reasoning ("thinking",
+	// "reasoning_content", Gemini thought parts). It is persisted for
+	// inspection but is NOT part of the user-facing response stream, so it
+	// does not count toward chunk / TTFT / ITL metrics.
+	ChunkThinking
+)
 
 // ProbeStream is the read-side of an active probe.
 type ProbeStream interface {
@@ -55,6 +73,13 @@ type ProbeStream interface {
 	// the middle were dropped. Adapters use RespCapture under the hood;
 	// see respcap.go.
 	ResponseSnapshot() (head []byte, tail []byte, truncated bool)
+	// ContentCapture returns the semantic content observed while the stream
+	// was consumed (§18.14) — today the model's reasoning trace.
+	//
+	// It must be read *after* Chunks() is closed; the adapter fills it in
+	// as frames arrive, because the reasoning text cannot be recovered
+	// from the bounded head/tail byte capture afterwards.
+	ContentCapture() ContentCapture
 }
 
 // ChatProtocolAdapter is implemented by every supported protocol.

@@ -27,6 +27,9 @@ type Adapter struct {
 	ua   string
 	http *http.Client
 	rid  func() string
+	// insecureSkipVerify mirrors deps.InsecureSkipVerify — the instance-wide
+	// "don't verify upstream certs" switch.
+	insecureSkipVerify bool
 }
 
 // NewAdapter constructs an Anthropic adapter.
@@ -38,7 +41,12 @@ func NewAdapter(deps protocol.AdapterDeps) protocol.ChatProtocolAdapter {
 	if ua == "" {
 		ua = "ai-monitor/1.0 (+anthropic)"
 	}
-	return &Adapter{ua: ua, http: deps.HTTPClient, rid: deps.RequestIDGenerator}
+	return &Adapter{
+		ua:                 ua,
+		http:               deps.HTTPClient,
+		rid:                deps.RequestIDGenerator,
+		insecureSkipVerify: deps.InsecureSkipVerify,
+	}
 }
 
 // Name returns the protocol name.
@@ -77,6 +85,8 @@ type stream struct {
 	requestID   string
 	requestBody []byte
 	respCapture *protocol.RespCapture
+	// §18.14 — reasoning content accumulated while consuming the stream.
+	thinking *protocol.TextAccumulator
 }
 
 // RequestID returns the X-Req-Id used on the outbound request.
@@ -91,6 +101,14 @@ func (s *stream) ResponseSnapshot() (head, tail []byte, truncated bool) {
 		return nil, nil, false
 	}
 	return s.respCapture.Snapshot()
+}
+
+// ContentCapture returns the reasoning content seen so far (§18.14).
+func (s *stream) ContentCapture() protocol.ContentCapture {
+	return protocol.ContentCapture{
+		ThinkingContent: s.thinking.String(),
+		Truncated:       s.thinking.Truncated(),
+	}
 }
 
 // Chunks returns the read channel.
@@ -155,15 +173,21 @@ func (a *Adapter) Probe(ctx context.Context, cfg *config.TaskConfig) (protocol.P
 		}
 	}
 
-	resp, err := a.http.Do(req)
+	resp, err := protocol.ClientFor(a.http, a.insecureSkipVerify, cfg).Do(req)
 	if err != nil {
 		cancel()
-		return nil, fmt.Errorf("anthropic: do: %w: %w", err, protocol.ErrUpstreamDown)
+		// §18.14 — keep the X-Req-Id attached to the failure so admins can
+		// grep the upstream logs for this exact attempt.
+		return nil, protocol.NewRequestError(rid, savedBody, "",
+			fmt.Errorf("anthropic: do: %w: %w", err, protocol.ErrUpstreamDown))
 	}
-	if err := protocol.ClassifyHTTPStatus(resp.StatusCode); err != nil {
+	if cerr := protocol.ClassifyHTTPStatus(resp.StatusCode); cerr != nil {
+		// §18.14 — the 4xx/5xx body usually says exactly what went wrong.
+		errBody := protocol.ReadErrorBody(resp.Body, protocol.DefaultErrorBodyCapture)
 		_ = resp.Body.Close()
 		cancel()
-		return nil, fmt.Errorf("anthropic: status %d: %w", resp.StatusCode, err)
+		return nil, protocol.NewRequestError(rid, savedBody, errBody,
+			fmt.Errorf("anthropic: status %d: %w", resp.StatusCode, cerr))
 	}
 	cap := protocol.NewRespCapture(protocol.DefaultRespHeadCapture, protocol.DefaultRespTailCapture)
 	tap := io.TeeReader(resp.Body, cap)
@@ -174,6 +198,7 @@ func (a *Adapter) Probe(ctx context.Context, cfg *config.TaskConfig) (protocol.P
 		requestID:   rid,
 		requestBody: savedBody,
 		respCapture: cap,
+		thinking:    protocol.NewTextAccumulator(protocol.DefaultContentCapture),
 	}
 	_ = reqTruncated
 	go a.consume(s, tap, httpCtx)
@@ -219,11 +244,19 @@ func (a *Adapter) consume(s *stream, body io.Reader, ctx context.Context) {
 				Delta struct {
 					Type string `json:"type"`
 					Text string `json:"text"`
+					// §18.14 — extended-thinking blocks arrive as
+					// "thinking_delta" with the text in "thinking".
+					Thinking string `json:"thinking"`
 				} `json:"delta"`
 			}
 			if err := json.Unmarshal([]byte(payload), &deltaEvent); err != nil {
 				s.setErr(fmt.Errorf("anthropic: parse delta: %w", err))
 				return
+			}
+			// §18.14 — route reasoning deltas to their own accumulator.
+			if deltaEvent.Delta.Thinking != "" {
+				s.thinking.WriteString(deltaEvent.Delta.Thinking)
+				continue
 			}
 			if deltaEvent.Delta.Text == "" {
 				continue
@@ -262,12 +295,24 @@ func (s *stream) setErr(err error) {
 }
 
 // reqMessage is the Anthropic messages POST body.
+//
+// Thinking — present only when the task's thinking switch is on. Anthropic
+// requires budget_tokens >= 1024 and max_tokens > budget_tokens, so
+// buildRequest derives a budget from the configured max_tokens and bumps
+// max_tokens when the two would collide.
 type reqMessage struct {
-	Model     string   `json:"model"`
-	Messages  []msgBlk `json:"messages"`
-	MaxTokens int      `json:"max_tokens"`
-	Stream    bool     `json:"stream"`
-	System    string   `json:"system,omitempty"`
+	Model     string       `json:"model"`
+	Messages  []msgBlk     `json:"messages"`
+	MaxTokens int          `json:"max_tokens"`
+	Stream    bool         `json:"stream"`
+	System    string       `json:"system,omitempty"`
+	Thinking  *thinkingCfg `json:"thinking,omitempty"`
+}
+
+// thinkingCfg is the extended-thinking request block.
+type thinkingCfg struct {
+	Type         string `json:"type"`
+	BudgetTokens int    `json:"budget_tokens"`
 }
 
 // msgBlk is one entry of the messages array.
@@ -278,8 +323,8 @@ type msgBlk struct {
 
 // buildRequest builds the payload, expanding prompt variables.
 func buildRequest(cfg *config.TaskConfig) ([]byte, error) {
-	userPrompt := expandVars(cfg.UserPrompt, cfg.PromptVars)
-	sysPrompt := expandVars(cfg.SystemPrompt, cfg.PromptVars)
+	userPrompt := protocol.ExpandVars(cfg.UserPrompt, cfg.PromptVars)
+	sysPrompt := protocol.ExpandVars(cfg.SystemPrompt, cfg.PromptVars)
 	maxTokens := 1024
 	if cfg.Anthropic != nil && cfg.Anthropic.MaxTokens > 0 {
 		maxTokens = cfg.Anthropic.MaxTokens
@@ -291,19 +336,20 @@ func buildRequest(cfg *config.TaskConfig) ([]byte, error) {
 		System:    sysPrompt,
 		Messages:  []msgBlk{{Role: "user", Content: userPrompt}},
 	}
+	if cfg.ThinkingEnabled {
+		// budget_tokens floor is 1024 and must stay below max_tokens.
+		// Generous budgets only make sense when max_tokens can afford one.
+		budget := 1024
+		if maxTokens >= 2048 {
+			budget = maxTokens / 2
+		}
+		if maxTokens <= budget {
+			maxTokens = budget + 1024
+		}
+		body.MaxTokens = maxTokens
+		body.Thinking = &thinkingCfg{Type: "enabled", BudgetTokens: budget}
+	}
 	return json.Marshal(body)
-}
-
-// expandVars replaces ${var} tokens with values from the supplied map.
-func expandVars(s string, vars map[string]string) string {
-	if len(vars) == 0 {
-		return s
-	}
-	out := s
-	for k, v := range vars {
-		out = strings.ReplaceAll(out, "${"+k+"}", v)
-	}
-	return out
 }
 
 func joinURL(base, path string) (string, error) {

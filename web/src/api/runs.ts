@@ -36,6 +36,19 @@ export interface ProbeRun {
   request_truncated?: boolean
   /** True when response middle bytes were dropped. */
   response_truncated?: boolean
+  // §18.14 — semantic content. Each field is capped server-side
+  // (16 KiB) and may be empty for legacy rows or models that do not
+  // emit reasoning.
+  /** Input actually sent to the model (system + user, vars expanded). */
+  input_content?: string
+  /** Model's reasoning trace; empty when the model emits none. */
+  thinking_content?: string
+  /** The model's answer text. */
+  output_content?: string
+  /** True when any of the three content fields hit the size cap. */
+  content_truncated?: boolean
+  /** Body of a failed (4xx/5xx) response; empty on success. */
+  response_error_body?: string
 }
 
 export const runsApi = {

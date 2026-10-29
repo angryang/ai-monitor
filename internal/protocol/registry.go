@@ -19,6 +19,11 @@ type AdapterDeps struct {
 	// RequestIDGenerator produces a per-probe id used as X-Req-Id. Nil falls
 	// back to uuid.NewString. Tests inject a deterministic closure.
 	RequestIDGenerator func() string
+	// InsecureSkipVerify is the instance-wide switch that disables upstream
+	// TLS certificate verification for every task. Individual tasks can
+	// also opt out on their own via TaskConfig.InsecureSkipVerify; the two
+	// are OR'ed (see ClientFor).
+	InsecureSkipVerify bool
 }
 
 // AdapterFactory returns a freshly-constructed ChatProtocolAdapter.

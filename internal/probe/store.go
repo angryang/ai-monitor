@@ -57,6 +57,25 @@ type ProbeRun struct {
 	ResponseTail     string `gorm:"type:text" json:"response_tail,omitempty"`
 	RequestTruncated bool   `gorm:"not null;default:false" json:"request_truncated"`
 	ResponseTruncated bool  `gorm:"not null;default:false" json:"response_truncated"`
+
+	// §18.14 — 语义化内容。原始字节（request_body / response_head /
+	// response_tail）适合取证，但不适合"读懂这次探测到底发生了什么"。
+	// 这几列把一次探测拆成 admin 能直接读的三段：
+	//
+	//	InputContent    — 实际发给模型的输入（system + user，变量已展开）
+	//	ThinkingContent — 模型的推理过程（reasoning / thinking）
+	//	OutputContent   — 模型最终的回答正文
+	//
+	// 三列各自受 protocol.DefaultContentCapture（16 KiB）上限约束，
+	// 超出部分截断并置位 ContentTruncated。
+	InputContent    string `gorm:"type:text" json:"input_content,omitempty"`
+	ThinkingContent string `gorm:"type:text" json:"thinking_content,omitempty"`
+	OutputContent   string `gorm:"type:text" json:"output_content,omitempty"`
+	// ContentTruncated 表示三段内容中至少有一段触达上限被截断。
+	ContentTruncated bool `gorm:"not null;default:false" json:"content_truncated"`
+	// ResponseErrorBody 保存失败响应体（4xx/5xx）的前若干字节——上游最常
+	// 把真正的原因写在这里（"Incorrect API key provided"）。成功时为空。
+	ResponseErrorBody string `gorm:"type:text" json:"response_error_body,omitempty"`
 }
 
 // TableName pins the SQL name to `probe_runs`. We avoid GORM's default
@@ -105,6 +124,12 @@ func FromResult(r Result) ProbeRun {
 		ResponseTail:      string(r.ResponseTail),
 		RequestTruncated:  r.RequestTruncated,
 		ResponseTruncated: r.ResponseTruncated,
+		// §18.14 — semantic content.
+		InputContent:      r.InputContent,
+		ThinkingContent:   r.ThinkingContent,
+		OutputContent:     r.OutputContent,
+		ContentTruncated:  r.ContentTruncated,
+		ResponseErrorBody: r.ResponseErrorBody,
 	}
 }
 

@@ -70,12 +70,18 @@ func (m *memStore) UpdateTask(_ context.Context, tc *config.TaskConfig) error {
 }
 
 func (m *memStore) ListTasks(_ context.Context) ([]config.TaskConfig, error) {
-	return nil, nil
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	out := make([]config.TaskConfig, 0, len(m.tasks))
+	for _, tc := range m.tasks {
+		out = append(out, tc)
+	}
+	return out, nil
 }
 func (m *memStore) CreateTask(_ context.Context, _ *config.TaskConfig) error { return nil }
-func (m *memStore) DeleteTask(_ context.Context, _ string) error              { return nil }
-func (m *memStore) Watch(_ context.Context) (<-chan config.Event, error)       { return nil, nil }
-func (m *memStore) Close() error                                               { return nil }
+func (m *memStore) DeleteTask(_ context.Context, _ string) error             { return nil }
+func (m *memStore) Watch(_ context.Context) (<-chan config.Event, error)     { return nil, nil }
+func (m *memStore) Close() error                                             { return nil }
 
 // memScheduler records Add / Remove calls. It satisfies scheduler.Scheduler
 // and lets us assert "scheduler.Add was called once with this exact task".
@@ -105,20 +111,20 @@ func (m *memScheduler) Remove(id string) error {
 	m.removed = append(m.removed, id)
 	return nil
 }
-func (m *memScheduler) Start(_ context.Context) error                              { return nil }
-func (m *memScheduler) Stop(_ context.Context) error                               { return nil }
-func (m *memScheduler) Reload(_ context.Context, _ []config.TaskConfig) error      { return nil }
+func (m *memScheduler) Start(_ context.Context) error                         { return nil }
+func (m *memScheduler) Stop(_ context.Context) error                          { return nil }
+func (m *memScheduler) Reload(_ context.Context, _ []config.TaskConfig) error { return nil }
 
 func seedTask(id string, enabled bool) config.TaskConfig {
 	return config.TaskConfig{
-		ID:       id,
-		Name:     id,
-		Enabled:  enabled,
-		Protocol: config.ProtocolOpenAI,
-		BaseURL:  "https://example.test",
-		Model:    "gpt-test",
+		ID:         id,
+		Name:       id,
+		Enabled:    enabled,
+		Protocol:   config.ProtocolOpenAI,
+		BaseURL:    "https://example.test",
+		Model:      "gpt-test",
 		UserPrompt: "hi",
-		Schedule: "@every 1m",
+		Schedule:   "@every 1m",
 	}
 }
 
@@ -329,5 +335,175 @@ func TestStopTask_PersistenceFailureAfterRetract(t *testing.T) {
 	}
 }
 
+// TestPatchTask_InsecureSkipVerifyMerge pins the PATCH semantics of the
+// TLS switch: an absent field keeps the stored value, an explicit false
+// turns verification back on.
+func TestPatchTask_InsecureSkipVerifyMerge(t *testing.T) {
+	base := seedTask("alpha", true)
+	base.InsecureSkipVerify = true
+	store := newMemStore(t, base)
+	h := NewAdminTaskHandlers(&AdminTaskHandlersConfig{
+		Store:  store,
+		Logger: func(string, ...any) {},
+	})
+
+	// 1. PATCH without the field keeps the stored true.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("PATCH", "/admin/tasks/alpha", strings.NewReader(`{"name":"alpha"}`))
+	req.SetPathValue("id", "alpha")
+	h.patch(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status: got %d, want 200 — body=%s", rec.Code, rec.Body.String())
+	}
+	if !store.tasks["alpha"].InsecureSkipVerify {
+		t.Fatalf("an absent field must keep the stored value")
+	}
+
+	// 2. PATCH with an explicit false turns it off.
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest("PATCH", "/admin/tasks/alpha", strings.NewReader(`{"insecure_skip_verify":false}`))
+	req.SetPathValue("id", "alpha")
+	h.patch(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status: got %d, want 200 — body=%s", rec.Code, rec.Body.String())
+	}
+	if store.tasks["alpha"].InsecureSkipVerify {
+		t.Fatalf("an explicit false must turn the switch off")
+	}
+}
+
+// TestListTasks_ReportsGlobalTLS verifies the response carries both the
+// per-task flag and the instance-wide switch so the UI can explain why a
+// task still skips verification.
+func TestListTasks_ReportsGlobalTLS(t *testing.T) {
+	task := seedTask("alpha", true)
+	store := newMemStore(t, task)
+	h := NewAdminTaskHandlers(&AdminTaskHandlersConfig{
+		Store:              store,
+		Logger:             func(string, ...any) {},
+		InsecureSkipVerify: true,
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/admin/tasks", nil)
+	h.list(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status: got %d, want 200", rec.Code)
+	}
+	var parsed struct {
+		Tasks []struct {
+			InsecureSkipVerify       bool `json:"insecure_skip_verify"`
+			InsecureSkipVerifyGlobal bool `json:"insecure_skip_verify_global"`
+		} `json:"tasks"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &parsed); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(parsed.Tasks) != 1 {
+		t.Fatalf("expected 1 task, got %d", len(parsed.Tasks))
+	}
+	if parsed.Tasks[0].InsecureSkipVerifyGlobal != true {
+		t.Fatalf("the global switch must be reported to clients")
+	}
+}
+
+// TestListTasks_ReportsSecretError verifies that a task whose secrets could
+// not be decrypted is still listed, with secret_error set, so the operator
+// can see it and re-enter the api key.
+func TestListTasks_ReportsSecretError(t *testing.T) {
+	task := seedTask("alpha", true)
+	task.SecretError = "config: decrypt api_key: master key mismatch"
+	store := newMemStore(t, task)
+	h := NewAdminTaskHandlers(&AdminTaskHandlersConfig{
+		Store:  store,
+		Logger: func(string, ...any) {},
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/admin/tasks", nil)
+	h.list(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status: got %d, want 200", rec.Code)
+	}
+	var parsed struct {
+		Tasks []struct {
+			ID          string `json:"id"`
+			SecretError string `json:"secret_error"`
+		} `json:"tasks"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &parsed); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(parsed.Tasks) != 1 {
+		t.Fatalf("expected 1 task, got %d", len(parsed.Tasks))
+	}
+	if parsed.Tasks[0].SecretError == "" {
+		t.Fatal("secret_error must be reported so the UI can flag the task")
+	}
+}
+
 // silence unused imports if the suite grows.
 var _ scheduler.Scheduler = (*memScheduler)(nil)
+
+// TestPatchTask_ThinkingEnabledMerge mirrors the TLS-switch merge test:
+// an absent thinking_enabled keeps the stored value; an explicit false
+// turns it off.
+func TestPatchTask_ThinkingEnabledMerge(t *testing.T) {
+	base := seedTask("alpha", true)
+	base.ThinkingEnabled = true
+	store := newMemStore(t, base)
+	h := NewAdminTaskHandlers(&AdminTaskHandlersConfig{
+		Store:  store,
+		Logger: func(string, ...any) {},
+	})
+
+	// 1. PATCH without the field keeps the stored true.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("PATCH", "/admin/tasks/alpha", strings.NewReader(`{"name":"alpha"}`))
+	req.SetPathValue("id", "alpha")
+	h.patch(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status: got %d, want 200 — body=%s", rec.Code, rec.Body.String())
+	}
+	if !store.tasks["alpha"].ThinkingEnabled {
+		t.Fatalf("an absent field must keep the stored value")
+	}
+
+	// 2. PATCH with an explicit false turns it off.
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest("PATCH", "/admin/tasks/alpha", strings.NewReader(`{"thinking_enabled":false}`))
+	req.SetPathValue("id", "alpha")
+	h.patch(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status: got %d, want 200 — body=%s", rec.Code, rec.Body.String())
+	}
+	if store.tasks["alpha"].ThinkingEnabled {
+		t.Fatalf("an explicit false must turn the switch off")
+	}
+}
+
+// TestGetTask_ReportsThinkingEnabled verifies the response carries the
+// per-task thinking flag so the edit form can hydrate the switch.
+func TestGetTask_ReportsThinkingEnabled(t *testing.T) {
+	task := seedTask("alpha", true)
+	task.ThinkingEnabled = true
+	store := newMemStore(t, task)
+	h := NewAdminTaskHandlers(&AdminTaskHandlersConfig{
+		Store:  store,
+		Logger: func(string, ...any) {},
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/admin/tasks/alpha", nil)
+	req.SetPathValue("id", "alpha")
+	h.get(rec, req)
+	if rec.Code != 200 {
+		t.Fatalf("status: got %d, want 200 — body=%s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		ThinkingEnabled bool `json:"thinking_enabled"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if !body.ThinkingEnabled {
+		t.Fatalf("thinking_enabled = false, want true")
+	}
+}

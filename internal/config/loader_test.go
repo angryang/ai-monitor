@@ -132,3 +132,73 @@ func TestDefaults_TasksEmpty(t *testing.T) {
 		t.Fatalf("default cfg.Tasks must be empty")
 	}
 }
+
+// TestLoad_InsecureSkipVerify_YAML covers the instance-wide TLS switch
+// coming from the YAML layer.
+func TestLoad_InsecureSkipVerify_YAML(t *testing.T) {
+	dir, cleanup := mkTempDir(t)
+	defer cleanup()
+	path := filepath.Join(dir, "c.yaml")
+	if err := os.WriteFile(path, []byte("insecure_skip_verify: true\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	t.Setenv("AI_MONITOR_MASTER_KEY", "")
+	t.Setenv("AI_MONITOR_INSECURE_SKIP_VERIFY", "")
+	cfg, err := Load(path, FlagOverrides{MasterKey: testMasterKey})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.InsecureSkipVerify {
+		t.Fatalf("insecure_skip_verify must be true from YAML")
+	}
+}
+
+// TestLoad_InsecureSkipVerify_Env checks the env layer beats YAML.
+func TestLoad_InsecureSkipVerify_Env(t *testing.T) {
+	dir, cleanup := mkTempDir(t)
+	defer cleanup()
+	path := filepath.Join(dir, "c.yaml")
+	if err := os.WriteFile(path, []byte("insecure_skip_verify: false\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	t.Setenv("AI_MONITOR_MASTER_KEY", "")
+	t.Setenv("AI_MONITOR_INSECURE_SKIP_VERIFY", "true")
+	cfg, err := Load(path, FlagOverrides{MasterKey: testMasterKey})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.InsecureSkipVerify {
+		t.Fatalf("env must beat yaml")
+	}
+}
+
+// TestLoad_InsecureSkipVerify_FlagOverrides checks the flag layer wins
+// and, crucially, that an explicit false can turn the switch back off.
+func TestLoad_InsecureSkipVerify_FlagOverrides(t *testing.T) {
+	dir, cleanup := mkTempDir(t)
+	defer cleanup()
+	path := filepath.Join(dir, "c.yaml")
+	if err := os.WriteFile(path, []byte("insecure_skip_verify: true\n"), 0o644); err != nil {
+		t.Fatalf("write: %v", err)
+	}
+	t.Setenv("AI_MONITOR_MASTER_KEY", "")
+	t.Setenv("AI_MONITOR_INSECURE_SKIP_VERIFY", "")
+
+	off := false
+	cfg, err := Load(path, FlagOverrides{MasterKey: testMasterKey, InsecureSkipVerify: &off})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.InsecureSkipVerify {
+		t.Fatalf("flag must beat yaml")
+	}
+
+	// A nil pointer means "no override" — YAML must survive.
+	cfg, err = Load(path, FlagOverrides{MasterKey: testMasterKey})
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if !cfg.InsecureSkipVerify {
+		t.Fatalf("a nil flag override must not clear the YAML value")
+	}
+}

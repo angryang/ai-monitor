@@ -33,6 +33,22 @@ type AESCipher struct {
 // ErrInvalidKey is returned when the supplied key doesn't fit AES-256.
 var ErrInvalidKey = errors.New("config: master key must be 32 bytes")
 
+// ErrMasterKeyMismatch is returned when a sealed blob cannot be opened with
+// the current master key.
+//
+// AES-GCM authenticates as well as encrypts, so a wrong key is
+// indistinguishable from tampered data — the failure surfaces as
+// "cipher: message authentication failed". In practice that almost always
+// means one of:
+//
+//   - AI_MONITOR_MASTER_KEY changed since the row was written;
+//   - the SQLite file was copied from another instance / another key;
+//   - the row was written by a run that used a throwaway key.
+//
+// Callers can test for it with errors.Is and surface an actionable message
+// instead of the bare cipher error.
+var ErrMasterKeyMismatch = errors.New("config: decrypt: master key does not match the encrypted data")
+
 // NewAESCipher constructs an AES-GCM AEAD with a 32-byte key (AES-256). The
 // returned cipher is safe for concurrent use across goroutines.
 func NewAESCipher(masterKey []byte) (*AESCipher, error) {
@@ -69,7 +85,7 @@ func (c *AESCipher) Encrypt(plaintext []byte) ([]byte, error) {
 
 // Decrypt opens a sealed blob produced by Encrypt. Wrong-key / tampered data
 // surfaces as an error; we deliberately do not distinguish them so we don't
-// leak oracle info.
+// leak oracle info — both are reported as ErrMasterKeyMismatch.
 func (c *AESCipher) Decrypt(ciphertext []byte) ([]byte, error) {
 	if c == nil || c.aead == nil {
 		return nil, fmt.Errorf("config: nil cipher")
@@ -81,7 +97,7 @@ func (c *AESCipher) Decrypt(ciphertext []byte) ([]byte, error) {
 	nonce, body := ciphertext[:ns], ciphertext[ns:]
 	plain, err := c.aead.Open(nil, nonce, body, nil)
 	if err != nil {
-		return nil, fmt.Errorf("config: decrypt: %w", err)
+		return nil, fmt.Errorf("%w: %w", ErrMasterKeyMismatch, err)
 	}
 	return plain, nil
 }

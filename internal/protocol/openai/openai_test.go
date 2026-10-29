@@ -5,6 +5,7 @@ package openai
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -31,12 +32,12 @@ func newAdapter(t *testing.T) *Adapter {
 
 func baseTask() *config.TaskConfig {
 	return &config.TaskConfig{
-		ID:       "t-1",
-		Name:     "openai-test",
-		Protocol: config.ProtocolOpenAI,
-		BaseURL:  "http://127.0.0.1:0",
-		APIKey:   "sk-test",
-		Model:    "gpt-4o",
+		ID:         "t-1",
+		Name:       "openai-test",
+		Protocol:   config.ProtocolOpenAI,
+		BaseURL:    "http://127.0.0.1:0",
+		APIKey:     "sk-test",
+		Model:      "gpt-4o",
 		UserPrompt: "hello",
 	}
 }
@@ -312,5 +313,116 @@ func TestOpenAI_Probe_UserReqIDFromExtras(t *testing.T) {
 	}
 	if captured != "upstream-trace-42" {
 		t.Fatalf("X-Req-Id: got %q, want %q", captured, "upstream-trace-42")
+	}
+}
+
+// TestOpenAI_Probe_CapturesReasoningAndRequestID verifies §18.14:
+// the reasoning trace is captured separately from the answer, and the
+// X-Req-Id is recoverable even when the upstream rejects the request.
+func TestOpenAI_Probe_CapturesReasoningAndRequestID(t *testing.T) {
+	adapter := newAdapter(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(200)
+		for _, line := range []string{
+			`data: {"choices":[{"delta":{"reasoning_content":"先想一想"},"finish_reason":""}]}`,
+			`data: {"choices":[{"delta":{"content":"答案"},"finish_reason":""}]}`,
+			`data: {"choices":[{"delta":{"content":"! "},"finish_reason":""}]}`,
+			`data: {"choices":[{"delta":{"content":""},"finish_reason":"stop"}]}`,
+			`data: [DONE]`,
+		} {
+			_, _ = io.WriteString(w, line+"\n\n")
+			if f, ok := w.(http.Flusher); ok {
+				f.Flush()
+			}
+		}
+	}))
+	defer srv.Close()
+	cfg := baseTask()
+	cfg.BaseURL = srv.URL
+
+	s, err := adapter.Probe(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	defer s.Close()
+
+	var content string
+	for c := range s.Chunks() {
+		if c.Kind == protocol.ChunkContent {
+			content += c.Delta
+		}
+	}
+	if content != "答案! " {
+		t.Fatalf("content = %q, want %q", content, "答案! ")
+	}
+	cap := s.ContentCapture()
+	if cap.ThinkingContent != "先想一想" {
+		t.Fatalf("thinking = %q", cap.ThinkingContent)
+	}
+	if cap.Truncated {
+		t.Fatal("unexpected truncation")
+	}
+	if s.RequestID() == "" {
+		t.Fatal("expected a request id")
+	}
+}
+
+// TestOpenAI_Probe_UnauthorizedKeepsRequestID verifies that a 401 still
+// carries the X-Req-Id and the upstream error body, which are exactly
+// what an admin needs to chase the problem.
+func TestOpenAI_Probe_UnauthorizedKeepsRequestID(t *testing.T) {
+	adapter := newAdapter(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(401)
+		_, _ = io.WriteString(w, `{"error":{"message":"Incorrect API key provided"}}`)
+	}))
+	defer srv.Close()
+	cfg := baseTask()
+	cfg.BaseURL = srv.URL
+
+	_, err := adapter.Probe(context.Background(), cfg)
+	if !errors.Is(err, protocol.ErrUnauthorized) {
+		t.Fatalf("err: got %v, want ErrUnauthorized", err)
+	}
+	var reqErr *protocol.RequestError
+	if !errors.As(err, &reqErr) {
+		t.Fatalf("expected a RequestError, got %T", err)
+	}
+	if reqErr.RequestID == "" {
+		t.Fatal("request id lost on the failure path")
+	}
+	if !strings.Contains(reqErr.ResponseBody, "Incorrect API key") {
+		t.Fatalf("error body = %q", reqErr.ResponseBody)
+	}
+}
+
+// TestOpenAI_BuildRequest_ThinkingSwitch verifies the per-task thinking
+// switch: on → `enable_thinking: true` on the wire; off → the field is
+// omitted entirely so the request is byte-identical to the pre-flag shape.
+func TestOpenAI_BuildRequest_ThinkingSwitch(t *testing.T) {
+	off := baseTask()
+	raw, err := buildRequest(off)
+	if err != nil {
+		t.Fatalf("buildRequest: %v", err)
+	}
+	if strings.Contains(string(raw), "enable_thinking") {
+		t.Fatalf("thinking off must omit enable_thinking: %s", raw)
+	}
+
+	on := baseTask()
+	on.ThinkingEnabled = true
+	raw, err = buildRequest(on)
+	if err != nil {
+		t.Fatalf("buildRequest: %v", err)
+	}
+	var body struct {
+		EnableThinking *bool `json:"enable_thinking"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if body.EnableThinking == nil || !*body.EnableThinking {
+		t.Fatalf("thinking on must set enable_thinking=true: %s", raw)
 	}
 }

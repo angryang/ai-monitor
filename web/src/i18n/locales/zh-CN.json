@@ -97,6 +97,22 @@
         "copyRespHead": "复制响应 head",
         "copyRespTail": "复制响应 tail",
         "show": "查看请求 / 响应"
+      },
+      "reqId": "X-Req-Id",
+      "copyReqId": "复制 X-Req-Id",
+      "errBody": "上游响应",
+      "copyErrBody": "复制上游响应体",
+      "content": {
+        "title": "内容解析",
+        "input": "输入",
+        "thinking": "思考",
+        "output": "输出",
+        "missing": "—",
+        "noThinking": "该模型未返回思考内容",
+        "copyInput": "复制输入内容",
+        "copyThinking": "复制思考内容",
+        "copyOutput": "复制输出内容",
+        "truncatedNote": "内容超过 16 KiB 上限，已截断"
       }
     },
     "list": {
@@ -112,7 +128,10 @@
       "subtitle": "活跃的探测配置；悬停一行查看完整参数",
       "new": "新建任务",
       "emptyTitle": "暂无任务",
-      "emptyDesc": "创建一个任务，开始探测你的 AI 服务。"
+      "emptyDesc": "创建一个任务，开始探测你的 AI 服务。",
+      "secretErrorTitle": "部分任务的密钥无法解密",
+      "secretErrorDesc": "以下任务：{names}。当前主密钥与保存时的密钥不一致，这些任务暂时不会参与调度。请在编辑页重新填写 API Key 以恢复。",
+      "secretErrorBadge": "密钥无法解密，请重新填写"
     },
     "col": {
       "name": "名称",
@@ -173,6 +192,12 @@
       "timeout": "超时",
       "timeoutHint": "例如 30s",
       "canary": "灰度分组",
+      "tls": "TLS 证书校验",
+      "insecureSkipVerify": "忽略上游证书校验",
+      "insecureSkipVerifyHint": "上游使用自签名证书或私有 CA 时开启。关闭后该连接不再防中间人攻击，请仅在可信网络内使用。",
+      "thinking": "思考模式",
+      "thinkingLabel": "启用思考模式",
+      "thinkingHint": "开启后探测请求会显式要求模型输出推理过程（OpenAI 兼容：enable_thinking · Anthropic：thinking 块 · Gemini：thinkingConfig）。关闭时不发送思考参数，跟随上游默认行为。",
       "userPrompt": "用户提示词",
       "systemPrompt": "系统提示词",
       "notification": "通知设置",

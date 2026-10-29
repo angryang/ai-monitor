@@ -34,6 +34,8 @@ type Server struct {
 	authMiddleware *auth.Middleware
 	// userStore backs /admin/users. nil when auth is disabled.
 	userStore auth.UserStore
+	// log emits structured lines; never nil (New installs a no-op default).
+	log LoggerFunc
 }
 
 // Options carries the dependencies needed by the richer server implementation.
@@ -56,6 +58,9 @@ type Options struct {
 	// Cipher encrypts apikey + webhook at rest when admin/tasks writes
 	// arrive through the HTTP layer. Optional.
 	Cipher config.Cipher
+	// InsecureSkipVerify mirrors the instance-wide TLS switch so the admin
+	// API can report it alongside each task.
+	InsecureSkipVerify bool
 	// RunStore backs the /admin/tasks/{id}/runs endpoint. Optional; if
 	// nil the endpoint returns 503 so admins know history is disabled.
 	RunStore probe.RunStore
@@ -64,6 +69,39 @@ type Options struct {
 // LoggerFunc matches the slog.Logger style signature used inside handler
 // goroutines (a *slog.Logger would pull a heavy import for tests).
 type LoggerFunc func(msg string, args ...any)
+
+// listTasks fetches every task, tolerating rows whose encrypted secrets
+// cannot be opened with the current master key.
+//
+// Such rows are still returned (with SecretError set, secrets empty) so the
+// UI can show the task and let an operator re-enter the api key. Without
+// this a single stale row would take the whole admin UI down — exactly when
+// it's needed to repair that row.
+//
+// A failure of the listing itself is returned as an error. It must never be
+// downgraded to "no tasks": an empty list is what the UI renders when the
+// user genuinely has no tasks, so swallowing the error makes every task
+// look like it silently disappeared.
+func (s *Server) listTasks(ctx context.Context) ([]config.TaskConfig, error) {
+	if ll, ok := s.store.(config.LenientTaskLister); ok {
+		tasks, errs, err := ll.ListTasksLenient(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, err := range errs {
+			s.log("task_secret_decrypt_failed", "err", err.Error())
+		}
+		return tasks, nil
+	}
+	return s.store.ListTasks(ctx)
+}
+
+// runnableTasks drops tasks that cannot be probed (undecryptable secrets).
+// They stay visible in the admin UI but must not enter the scheduler:
+// without an api key every probe would fail and notify.
+func runnableTasks(tasks []config.TaskConfig) []config.TaskConfig {
+	return config.RunnableTasks(tasks)
+}
 
 // New constructs a Server with the provided options.
 func New(opts Options) *Server {
@@ -80,6 +118,7 @@ func New(opts Options) *Server {
 		sch:            opts.Scheduler,
 		authMiddleware: opts.Auth,
 		userStore:      opts.UserStore,
+		log:            logf,
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealthz(opts.Healthz))
@@ -142,7 +181,9 @@ func (s *Server) handleHealthz(custom http.Handler) http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(r.Context(), 1*time.Second)
 		defer cancel()
 		if s.store != nil {
-			if _, err := s.store.ListTasks(ctx); err != nil {
+			// Lenient: one task with undecryptable secrets must not make
+			// the whole instance look unhealthy.
+			if _, err := s.listTasks(ctx); err != nil {
 				w.WriteHeader(http.StatusServiceUnavailable)
 				_, _ = w.Write([]byte(`{"status":"db_unavailable"}`))
 				return
@@ -178,22 +219,29 @@ func (s *Server) buildAdminRoutes(opts Options) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /admin/reload", s.handleReload())
 
-	if opts.Auth != nil && opts.UserStore != nil {
-		cfg := &AdminTaskHandlersConfig{
-			Auth:      opts.Auth,
-			Users:     opts.UserStore,
-			Store:     opts.Store,
-			Cipher:    opts.Cipher,
-			RunStore:  opts.RunStore,
-			Scheduler: opts.Scheduler,
-			Logger:    opts.Logger,
-		}
-		// Mount admin_task_handlers directly on this mux so every method
-		// (GET / POST / PATCH / DELETE) is registered against the same
-		// pattern matcher. Using a sub-mux tripped over Go 1.22+ ServeMux
-		// prefix-stripping rules.
-		NewAdminTaskHandlers(cfg).Mount(mux)
+	cfg := &AdminTaskHandlersConfig{
+		Auth:      opts.Auth,
+		Users:     opts.UserStore,
+		Store:     opts.Store,
+		Cipher:    opts.Cipher,
+		RunStore:  opts.RunStore,
+		Scheduler: opts.Scheduler,
+		Logger:    opts.Logger,
+		// Echoed back to clients so the UI can explain that a task
+		// still skips verification because of the instance-wide switch.
+		InsecureSkipVerify: opts.InsecureSkipVerify,
+	}
+	// Mount admin_task_handlers directly on this mux so every method
+	// (GET / POST / PATCH / DELETE) is registered against the same
+	// pattern matcher. Using a sub-mux tripped over Go 1.22+ ServeMux
+	// prefix-stripping rules.
+	//
+	// The task routes are mounted even without auth: the handler falls
+	// back to no authentication in that case, preserving the pre-§18
+	// behaviour for builds that run without a JWT middleware.
+	NewAdminTaskHandlers(cfg).Mount(mux)
 
+	if opts.Auth != nil && opts.UserStore != nil {
 		userCfg := &AdminUserHandlersConfig{
 			Auth:   opts.Auth,
 			Users:  opts.UserStore,
@@ -214,12 +262,12 @@ func (s *Server) handleReload() http.HandlerFunc {
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
 		defer cancel()
-		tasks, err := s.store.ListTasks(ctx)
+		tasks, err := s.listTasks(ctx)
 		if err != nil {
 			WriteAPIError(w, http.StatusInternalServerError, "list_failed", err.Error())
 			return
 		}
-		if err := s.sch.Reload(ctx, tasks); err != nil {
+		if err := s.sch.Reload(ctx, runnableTasks(tasks)); err != nil {
 			WriteAPIError(w, http.StatusInternalServerError, "reload_failed", err.Error())
 			return
 		}

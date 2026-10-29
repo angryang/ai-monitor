@@ -27,8 +27,24 @@ export interface Task {
   schedule: string
   timeout: string
   canary_group: string
+  /** Per-task switch: skip upstream TLS certificate verification. */
+  insecure_skip_verify: boolean
+  /** Instance-wide switch: when true every probe skips verification. */
+  insecure_skip_verify_global: boolean
+  /**
+   * Per-task switch: ask the upstream model to emit its reasoning trace.
+   * Off means the probe sends no thinking parameter and follows the
+   * upstream default.
+   */
+  thinking_enabled: boolean
   notify: TaskNotify
   has_api_key: boolean
+  /**
+   * Non-empty when the server could not decrypt this task's stored secrets
+   * with the current master key. The task is listed but has no usable
+   * credentials until the api key is re-entered.
+   */
+  secret_error?: string
   created_at: string
   updated_at: string
   openai?: { stream_path?: string; extra_headers?: string } | null
@@ -49,6 +65,10 @@ export interface TaskWritePayload {
   schedule: string
   timeout?: string
   canary_group?: string
+  /** Omit to keep the stored value on PATCH; false turns verification back on. */
+  insecure_skip_verify?: boolean
+  /** Omit to keep the stored value on PATCH; false disables thinking. */
+  thinking_enabled?: boolean
   notify: {
     enabled: boolean
     channel?: string

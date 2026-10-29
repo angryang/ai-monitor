@@ -17,6 +17,12 @@
 *.db-shm
 *.db-wal
 
+# Local dev secrets written by scripts/run-local.sh: the generated AES-GCM
+# master key + JWT secret. Must stay on disk between restarts, otherwise
+# encrypted api_keys in the DB become undecryptable.
+.local-secrets
+.local-secrets.tmp.*
+
 # Go embed source: synced from web/dist by `make web-build`, then baked into
 # the binary via //go:embed. Must NEVER be committed; rebuild generates it.
 internal/webui/dist/
@@ -46,6 +52,8 @@ vendor/
 # ----------------------------------------------------------------------
 # web/ has its own .gitignore (node_modules / dist / .vite / *.local) — the
 # root file only adds the embed mirror handled above.
+# TypeScript incremental build cache (vue-tsc -b).
+web/tsconfig.tsbuildinfo
 
 # ----------------------------------------------------------------------
 # IDE / Editor

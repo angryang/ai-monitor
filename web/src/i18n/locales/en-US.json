@@ -97,6 +97,22 @@
         "copyRespHead": "copy response head",
         "copyRespTail": "copy response tail",
         "show": "view request / response"
+      },
+      "reqId": "X-Req-Id",
+      "copyReqId": "copy X-Req-Id",
+      "errBody": "upstream body",
+      "copyErrBody": "copy upstream response body",
+      "content": {
+        "title": "Content",
+        "input": "input",
+        "thinking": "thinking",
+        "output": "output",
+        "missing": "—",
+        "noThinking": "model returned no reasoning",
+        "copyInput": "copy input content",
+        "copyThinking": "copy thinking content",
+        "copyOutput": "copy output content",
+        "truncatedNote": "content exceeded the 16 KiB cap and was truncated"
       }
     },
     "list": {
@@ -112,7 +128,10 @@
       "subtitle": "live probe configurations; hover a row for full payload",
       "new": "New task",
       "emptyTitle": "No tasks yet",
-      "emptyDesc": "Create one to start probing your AI endpoints."
+      "emptyDesc": "Create one to start probing your AI endpoints.",
+      "secretErrorTitle": "Some task secrets could not be decrypted",
+      "secretErrorDesc": "Affected tasks: {names}. The current master key differs from the one used when they were saved, so they stay out of the scheduler. Re-enter the API key on the edit page to restore them.",
+      "secretErrorBadge": "secret unreadable — re-enter it"
     },
     "col": {
       "name": "name",
@@ -173,6 +192,12 @@
       "timeout": "Timeout",
       "timeoutHint": "e.g. 30s",
       "canary": "Canary group",
+      "tls": "TLS certificate verification",
+      "insecureSkipVerify": "Skip upstream certificate verification",
+      "insecureSkipVerifyHint": "Enable when the upstream uses a self-signed cert or a private CA. The connection then loses MITM protection — use it only on a trusted network.",
+      "thinking": "Thinking mode",
+      "thinkingLabel": "Enable thinking",
+      "thinkingHint": "Explicitly asks the model for its reasoning trace (OpenAI-compatible: enable_thinking · Anthropic: thinking block · Gemini: thinkingConfig). When off, no thinking parameter is sent and the upstream default applies.",
       "userPrompt": "User prompt",
       "systemPrompt": "System prompt",
       "notification": "Notification",

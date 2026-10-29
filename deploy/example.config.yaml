@@ -16,6 +16,15 @@ success_rate_window: 200
 success_rate_threshold: 0.8
 dedup_ttl: 5m
 
+# TLS certificate verification.
+#
+# false (default) = verify upstream certs normally.
+# true             = skip verification for EVERY probe (self-signed / private CA).
+#                   ⚠️ removes MITM protection — prefer the per-task
+#                   `insecure_skip_verify` below, which scopes the exemption
+#                   to a single endpoint.
+insecure_skip_verify: false
+
 # Buckets (per design.md §11.6.1)
 buckets_default: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30]
 buckets_ttft:    [0.01, 0.025, 0.05, 0.1, 0.2, 0.35, 0.5, 0.75, 1, 2, 5]
@@ -34,6 +43,10 @@ tasks:
     user_prompt: "Say hi at ${today}"
     prompt_vars:
       today: "{{.Now.Date}}"
+    # Skip upstream cert verification for this task only — set when the
+    # endpoint serves a self-signed cert or a private CA. Leave off for
+    # public endpoints (MITM protection).
+    insecure_skip_verify: false
     openai:
       stream_path: /v1/chat/completions
     notify:

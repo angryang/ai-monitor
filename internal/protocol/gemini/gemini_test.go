@@ -5,11 +5,13 @@ package gemini
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -190,7 +192,6 @@ func TestGemini_Probe_SendsExtraHeaders(t *testing.T) {
 	}
 }
 
-
 func TestGemini_Probe_GeneratesReqID(t *testing.T) {
 	var captured string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -210,5 +211,80 @@ func TestGemini_Probe_GeneratesReqID(t *testing.T) {
 	}
 	if captured == "" {
 		t.Fatalf("X-Req-Id missing")
+	}
+}
+
+// TestGemini_Probe_CapturesThoughtParts verifies §18.14: Gemini marks
+// reasoning parts with "thought": true, and those must be routed to the
+// thinking column instead of the answer.
+func TestGemini_Probe_CapturesThoughtParts(t *testing.T) {
+	adapter := newAdapter(t)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(200)
+		_, _ = io.WriteString(w, `[{"candidates":[{"content":{"parts":[`+
+			`{"text":"想一想","thought":true},`+
+			`{"text":"答案"}`+
+			`]}}]}]`)
+	}))
+	defer srv.Close()
+	cfg := baseTask()
+	cfg.BaseURL = srv.URL
+
+	s, err := adapter.Probe(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("Probe: %v", err)
+	}
+	defer s.Close()
+
+	var content string
+	for c := range s.Chunks() {
+		if c.Kind == protocol.ChunkContent {
+			content += c.Delta
+		}
+	}
+	if content != "答案" {
+		t.Fatalf("content = %q, want %q", content, "答案")
+	}
+	cap := s.ContentCapture()
+	if cap.ThinkingContent != "想一想" {
+		t.Fatalf("thinking = %q", cap.ThinkingContent)
+	}
+}
+
+// TestGemini_BuildRequest_ThinkingSwitch verifies the per-task thinking
+// switch: on → generationConfig.thinkingConfig.thinkingBudget = -1
+// (dynamic); off → generationConfig omitted entirely.
+func TestGemini_BuildRequest_ThinkingSwitch(t *testing.T) {
+	off := baseTask()
+	raw, err := buildRequest(off)
+	if err != nil {
+		t.Fatalf("buildRequest: %v", err)
+	}
+	if strings.Contains(string(raw), "generationConfig") {
+		t.Fatalf("thinking off must omit generationConfig: %s", raw)
+	}
+
+	on := baseTask()
+	on.ThinkingEnabled = true
+	raw, err = buildRequest(on)
+	if err != nil {
+		t.Fatalf("buildRequest: %v", err)
+	}
+	var body struct {
+		GenerationConfig *struct {
+			ThinkingConfig *struct {
+				ThinkingBudget int `json:"thinkingBudget"`
+			} `json:"thinkingConfig"`
+		} `json:"generationConfig"`
+	}
+	if err := json.Unmarshal(raw, &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if body.GenerationConfig == nil || body.GenerationConfig.ThinkingConfig == nil {
+		t.Fatalf("thinking on must include thinkingConfig: %s", raw)
+	}
+	if body.GenerationConfig.ThinkingConfig.ThinkingBudget != -1 {
+		t.Fatalf("thinkingBudget = %d, want -1 (dynamic)", body.GenerationConfig.ThinkingConfig.ThinkingBudget)
 	}
 }

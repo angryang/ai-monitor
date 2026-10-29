@@ -27,6 +27,9 @@ type Adapter struct {
 	ua   string
 	http *http.Client
 	rid  func() string
+	// insecureSkipVerify mirrors deps.InsecureSkipVerify — the instance-wide
+	// "don't verify upstream certs" switch.
+	insecureSkipVerify bool
 }
 
 // NewAdapter returns a new OpenAI adapter.
@@ -38,7 +41,12 @@ func NewAdapter(deps protocol.AdapterDeps) protocol.ChatProtocolAdapter {
 	if ua == "" {
 		ua = "ai-monitor/1.0 (+openai)"
 	}
-	return &Adapter{ua: ua, http: deps.HTTPClient, rid: deps.RequestIDGenerator}
+	return &Adapter{
+		ua:                 ua,
+		http:               deps.HTTPClient,
+		rid:                deps.RequestIDGenerator,
+		insecureSkipVerify: deps.InsecureSkipVerify,
+	}
 }
 
 // Name returns the protocol name.
@@ -72,9 +80,11 @@ type stream struct {
 	once   sync.Once
 	// §18.13 — captured so probe_runs can record what was actually
 	// sent and what bytes came back.
-	requestID    string
-	requestBody  []byte
-	respCapture  *protocol.RespCapture
+	requestID   string
+	requestBody []byte
+	respCapture *protocol.RespCapture
+	// §18.14 — reasoning content accumulated while consuming the stream.
+	thinking *protocol.TextAccumulator
 }
 
 // RequestID returns the X-Req-Id value used on the outbound request.
@@ -91,6 +101,14 @@ func (s *stream) ResponseSnapshot() (head, tail []byte, truncated bool) {
 		return nil, nil, false
 	}
 	return s.respCapture.Snapshot()
+}
+
+// ContentCapture returns the reasoning content seen so far (§18.14).
+func (s *stream) ContentCapture() protocol.ContentCapture {
+	return protocol.ContentCapture{
+		ThinkingContent: s.thinking.String(),
+		Truncated:       s.thinking.Truncated(),
+	}
 }
 
 // Chunks returns the channel.
@@ -166,15 +184,23 @@ func (a *Adapter) Probe(ctx context.Context, cfg *config.TaskConfig) (protocol.P
 		}
 	}
 
-	resp, err := a.http.Do(req)
+	resp, err := protocol.ClientFor(a.http, a.insecureSkipVerify, cfg).Do(req)
 	if err != nil {
 		cancel()
-		return nil, fmt.Errorf("openai: do: %w: %w", err, protocol.ErrUpstreamDown)
+		// §18.14 — keep the X-Req-Id attached to the failure so admins can
+		// grep the upstream logs for this exact attempt.
+		return nil, protocol.NewRequestError(rid, savedBody, "",
+			fmt.Errorf("openai: do: %w: %w", err, protocol.ErrUpstreamDown))
 	}
-	if err := protocol.ClassifyHTTPStatus(resp.StatusCode); err != nil {
+	if cerr := protocol.ClassifyHTTPStatus(resp.StatusCode); cerr != nil {
+		// §18.14 — the 4xx/5xx body usually says exactly what went wrong
+		// ("Incorrect API key provided: sk-…"). Read a bounded slice before
+		// closing so that clue survives into probe_runs.
+		errBody := protocol.ReadErrorBody(resp.Body, protocol.DefaultErrorBodyCapture)
 		_ = resp.Body.Close()
 		cancel()
-		return nil, fmt.Errorf("openai: status %d: %w", resp.StatusCode, err)
+		return nil, protocol.NewRequestError(rid, savedBody, errBody,
+			fmt.Errorf("openai: status %d: %w", resp.StatusCode, cerr))
 	}
 
 	cap := protocol.NewRespCapture(protocol.DefaultRespHeadCapture, protocol.DefaultRespTailCapture)
@@ -186,6 +212,7 @@ func (a *Adapter) Probe(ctx context.Context, cfg *config.TaskConfig) (protocol.P
 		requestID:   rid,
 		requestBody: savedBody, // pre-truncated to capture cap
 		respCapture: cap,
+		thinking:    protocol.NewTextAccumulator(protocol.DefaultContentCapture),
 	}
 	// reqTruncated is captured *between* bytes via stream.requestBody above;
 	// the adapter doesn't need to forward it explicitly — the persisted
@@ -232,6 +259,16 @@ func (a *Adapter) consume(s *stream, body io.Reader, ctx context.Context) {
 				return
 			}
 			for _, choice := range chunk.Choices {
+				// §18.14 — reasoning arrives in the same envelope as the
+				// answer but in a different field. Route it to its own
+				// accumulator so the persisted "思考" column is clean.
+				if think := protocol.FirstNonEmpty(
+					choice.Delta.ReasoningContent,
+					choice.Delta.Reasoning,
+					choice.Delta.Thinking,
+				); think != "" {
+					s.thinking.WriteString(think)
+				}
 				if choice.Delta.Content == "" && choice.FinishReason == "" {
 					continue
 				}
@@ -278,7 +315,30 @@ func (a *Adapter) consume(s *stream, body io.Reader, ctx context.Context) {
 				}
 			}
 		case <-scanDone:
-			return
+			// The scanner may have buffered one last frame (the terminal
+			// chunk) before returning. Both cases are ready here, and Go
+			// picks a ready case at random — so without this drain the
+			// final chunk of the answer is dropped roughly half the time.
+			// That silently truncates the captured output content.
+			for {
+				select {
+				case res := <-scanOut:
+					if res.err != nil {
+						s.setErr(res.err)
+						return
+					}
+					if res.ok && !s.isClosed() {
+						select {
+						case s.ch <- res.chunk:
+						case <-ctx.Done():
+							s.setErr(ctx.Err())
+							return
+						}
+					}
+				default:
+					return
+				}
+			}
 		}
 	}
 }
@@ -293,21 +353,37 @@ func (s *stream) setErr(err error) {
 }
 
 // openAIChunk is the subset of the OpenAI SSE payload we care about.
+//
+// §18.14 — Delta carries the reasoning field too. Reasoning-model vendors
+// disagree on the key: DeepSeek / Qwen use "reasoning_content", OpenRouter
+// uses "reasoning", Kimi (Moonshot) uses "thinking". We accept all three and
+// take the first non-empty one.
 type openAIChunk struct {
 	Choices []struct {
-		Index        int `json:"index"`
-		Delta        struct {
-			Content string `json:"content"`
+		Index int `json:"index"`
+		Delta struct {
+			Content          string `json:"content"`
+			ReasoningContent string `json:"reasoning_content"`
+			Reasoning        string `json:"reasoning"`
+			Thinking         string `json:"thinking"`
 		} `json:"delta"`
 		FinishReason string `json:"finish_reason"`
 	} `json:"choices"`
 }
 
 // chatRequest is the payload POSTed to the stream endpoint.
+//
+// ThinkingEnabled — when the task's thinking switch is on we send
+// `enable_thinking: true`, the convention honoured by the reasoning-model
+// ecosystem this probe targets (Qwen/DashScope, vLLM, SGLang, DeepSeek and
+// most OpenAI-compatible gateways; strict OpenAI officially ignores
+// unknown arguments on this field class). When the switch is off the field
+// is OMITTED so the wire bytes stay identical to the pre-flag behaviour.
 type chatRequest struct {
-	Model    string        `json:"model"`
-	Stream   bool          `json:"stream"`
-	Messages []chatMessage `json:"messages"`
+	Model          string        `json:"model"`
+	Stream         bool          `json:"stream"`
+	EnableThinking *bool         `json:"enable_thinking,omitempty"`
+	Messages       []chatMessage `json:"messages"`
 }
 
 // chatMessage is one element of the messages array.
@@ -330,8 +406,8 @@ func joinURL(base, path string) (string, error) {
 // buildRequest serialises the OpenAI chat payload, applying prompt-variable
 // expansion for UserPrompt.
 func buildRequest(cfg *config.TaskConfig) ([]byte, error) {
-	userPrompt := expandVars(cfg.UserPrompt, cfg.PromptVars)
-	sysPrompt := expandVars(cfg.SystemPrompt, cfg.PromptVars)
+	userPrompt := protocol.ExpandVars(cfg.UserPrompt, cfg.PromptVars)
+	sysPrompt := protocol.ExpandVars(cfg.SystemPrompt, cfg.PromptVars)
 	msgs := []chatMessage{{Role: "user", Content: userPrompt}}
 	if sysPrompt != "" {
 		// OpenAI prefers system as the first message.
@@ -342,20 +418,11 @@ func buildRequest(cfg *config.TaskConfig) ([]byte, error) {
 		Stream:   true,
 		Messages: msgs,
 	}
+	if cfg.ThinkingEnabled {
+		yes := true
+		payload.EnableThinking = &yes
+	}
 	return json.Marshal(payload)
-}
-
-// expandVars replaces each ${var} occurrence with the value from the
-// supplied map. Unknown variables are left untouched.
-func expandVars(s string, vars map[string]string) string {
-	if len(vars) == 0 {
-		return s
-	}
-	out := s
-	for k, v := range vars {
-		out = strings.ReplaceAll(out, "${"+k+"}", v)
-	}
-	return out
 }
 
 // init registers the adapter at package load time.

@@ -34,7 +34,11 @@ type AdminTaskHandlersConfig struct {
 	// Enabled flag. Optional; if nil, /start and /stop return 503 so admins
 	// know the binary was built without one.
 	Scheduler scheduler.Scheduler
-	Logger    LoggerFunc
+	// InsecureSkipVerify mirrors the instance-wide TLS switch. It is echoed
+	// back to clients so the UI can explain why a task still skips
+	// verification after the per-task flag was cleared.
+	InsecureSkipVerify bool
+	Logger             LoggerFunc
 }
 
 // AdminTaskHandlers is the bundle returned by NewAdminTaskHandlers.
@@ -52,18 +56,32 @@ func NewAdminTaskHandlers(cfg *AdminTaskHandlersConfig) *AdminTaskHandlers {
 
 // Mount registers every /admin/tasks route directly on parent. Returning
 // the same instance keeps the call site from editing parent mux wiring.
+//
+// When Auth is nil the routes are mounted without authentication. That
+// preserves the pre-§18 behaviour for builds/tests that run without auth —
+// the production binary always wires a middleware, so this only affects
+// the unauthenticated build.
 func (h *AdminTaskHandlers) Mount(mux *http.ServeMux) *http.ServeMux {
 	// Reads — any authenticated role.
-	mux.Handle("GET /admin/tasks", h.cfg.Auth.Authenticate(http.HandlerFunc(h.list)))
-	mux.Handle("GET /admin/tasks/{id}", h.cfg.Auth.Authenticate(http.HandlerFunc(h.get)))
-	mux.Handle("GET /admin/tasks/{id}/runs", h.cfg.Auth.Authenticate(http.HandlerFunc(h.listRuns)))
-
+	read := func(next http.HandlerFunc) http.Handler {
+		if h.cfg.Auth == nil {
+			return next
+		}
+		return h.cfg.Auth.Authenticate(next)
+	}
 	// Writes — admin only.
 	adminAuth := func(next http.HandlerFunc) http.Handler {
+		if h.cfg.Auth == nil {
+			return next
+		}
 		return h.cfg.Auth.RequireRole(auth.RoleAdmin, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			next.ServeHTTP(w, r)
 		}))
 	}
+	mux.Handle("GET /admin/tasks", read(h.list))
+	mux.Handle("GET /admin/tasks/{id}", read(h.get))
+	mux.Handle("GET /admin/tasks/{id}/runs", read(h.listRuns))
+
 	mux.Handle("POST /admin/tasks", adminAuth(h.create))
 	mux.Handle("PATCH /admin/tasks/{id}", adminAuth(h.patch))
 	mux.Handle("DELETE /admin/tasks/{id}", adminAuth(h.delete))
@@ -80,6 +98,49 @@ func (h *AdminTaskHandlers) Routes() http.Handler {
 
 // ---- task payload ----
 
+// log emits a structured line when a logger is configured. Safe on a nil
+// Logger so tests don't have to wire one.
+func (h *AdminTaskHandlers) log(msg string, args ...any) {
+	if h.cfg.Logger != nil {
+		h.cfg.Logger(msg, args...)
+	}
+}
+
+// listTasks fetches every task, tolerating rows whose encrypted secrets
+// cannot be opened with the current master key.
+//
+// Such rows are still returned (with SecretError set, secrets empty) so the
+// UI can show the task and let an operator re-enter the api key. Without
+// this the whole listing would fail and the admin UI would be unusable
+// exactly when it's needed most.
+//
+// A failure of the listing itself is returned as an error so the endpoint
+// answers 500 instead of 200 with an empty list. An empty list is what the
+// UI shows when the user genuinely has no tasks, so swallowing the error
+// makes every task look like it silently vanished.
+func (h *AdminTaskHandlers) listTasks(ctx context.Context) ([]config.TaskConfig, error) {
+	if ll, ok := h.cfg.Store.(config.LenientTaskLister); ok {
+		tasks, errs, err := ll.ListTasksLenient(ctx)
+		if err != nil {
+			return nil, err
+		}
+		for _, err := range errs {
+			h.log("task_secret_decrypt_failed", "err", err.Error())
+		}
+		return tasks, nil
+	}
+	return h.cfg.Store.ListTasks(ctx)
+}
+
+// getTaskLenient fetches one task, tolerating secrets that cannot be
+// decrypted with the current master key.
+func (h *AdminTaskHandlers) getTaskLenient(ctx context.Context, id string) (*config.TaskConfig, error) {
+	if g, ok := h.cfg.Store.(config.LenientTaskGetter); ok {
+		return g.GetTaskLenient(ctx, id)
+	}
+	return h.cfg.Store.GetTask(ctx, id)
+}
+
 // list returns the full task list as JSON (no secrets).
 func (h *AdminTaskHandlers) list(w http.ResponseWriter, r *http.Request) {
 	if h.cfg.Store == nil {
@@ -88,7 +149,7 @@ func (h *AdminTaskHandlers) list(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 	defer cancel()
-	tasks, err := h.cfg.Store.ListTasks(ctx)
+	tasks, err := h.listTasks(ctx)
 	if err != nil {
 		WriteAPIError(w, http.StatusInternalServerError, "list_failed", err.Error())
 		return
@@ -106,7 +167,7 @@ func (h *AdminTaskHandlers) list(w http.ResponseWriter, r *http.Request) {
 		tasks[i].APIKeyEnc = nil
 		tasks[i].Notify.WeComWebhook = ""
 		tasks[i].Notify.WeComWebhookEnc = nil
-		resp := redactTask(tasks[i])
+		resp := h.redactTask(tasks[i])
 		resp.HasAPIKey = hasKey
 		resp.Notify.HasWebhook = hasHook
 		out[i] = resp
@@ -130,8 +191,16 @@ func (h *AdminTaskHandlers) get(w http.ResponseWriter, r *http.Request) {
 			WriteAPIError(w, http.StatusNotFound, "task_not_found", id)
 			return
 		}
-		WriteAPIError(w, http.StatusInternalServerError, "get_failed", err.Error())
-		return
+		// A master key mismatch must not make the task unreachable: the
+		// operator still needs to open the edit form to re-enter the
+		// api key.
+		if errors.Is(err, config.ErrMasterKeyMismatch) {
+			t, err = h.getTaskLenient(ctx, id)
+		}
+		if err != nil {
+			WriteAPIError(w, http.StatusInternalServerError, "get_failed", err.Error())
+			return
+		}
 	}
 	// Capture has-* flags BEFORE nil-ing ciphertext, then restore on the
 	// response. See list() for the rationale.
@@ -142,7 +211,7 @@ func (h *AdminTaskHandlers) get(w http.ResponseWriter, r *http.Request) {
 	t.Notify.WeComWebhook = ""
 	t.Notify.WeComWebhookEnc = nil
 	// Same camelCase conversion as list() — see comment there.
-	resp := redactTask(*t)
+	resp := h.redactTask(*t)
 	resp.HasAPIKey = hasKey
 	resp.Notify.HasWebhook = hasHook
 	w.Header().Set("Content-Type", "application/json")
@@ -150,95 +219,120 @@ func (h *AdminTaskHandlers) get(w http.ResponseWriter, r *http.Request) {
 }
 
 type taskPayload struct {
-	ID         string            `json:"id,omitempty"`
-	Name       string            `json:"name"`
-	Enabled    *bool             `json:"enabled,omitempty"`
-	Protocol   string            `json:"protocol"`
-	BaseURL    string            `json:"base_url"`
-	APIKey     string            `json:"api_key,omitempty"`
-	Model      string            `json:"model"`
-	SystemPrompt string          `json:"system_prompt,omitempty"`
-	UserPrompt string            `json:"user_prompt"`
-	PromptVars map[string]string `json:"prompt_vars,omitempty"`
-	Schedule   string            `json:"schedule"`
+	ID           string            `json:"id,omitempty"`
+	Name         string            `json:"name"`
+	Enabled      *bool             `json:"enabled,omitempty"`
+	Protocol     string            `json:"protocol"`
+	BaseURL      string            `json:"base_url"`
+	APIKey       string            `json:"api_key,omitempty"`
+	Model        string            `json:"model"`
+	SystemPrompt string            `json:"system_prompt,omitempty"`
+	UserPrompt   string            `json:"user_prompt"`
+	PromptVars   map[string]string `json:"prompt_vars,omitempty"`
+	Schedule     string            `json:"schedule"`
 	// Timeout is a human-readable duration string (e.g. "30s", "1m30s").
 	// We accept it as a string here rather than `time.Duration` because
 	// Go's stdlib time.Duration JSON decoder requires the unit suffix
 	// (e.g. "30s" works but "30" alone is rejected), and accepting a
 	// string keeps the wire shape stable if we ever add new units.
-	Timeout      string  `json:"timeout,omitempty"`
-	CanaryGroup  string  `json:"canary_group,omitempty"`
-	Notify     notifyPayload `json:"notify"`
-	OpenAI     *config.OpenAIConfig    `json:"openai,omitempty"`
-	Anthropic  *config.AnthropicConfig `json:"anthropic,omitempty"`
-	Gemini     *config.GeminiConfig    `json:"gemini,omitempty"`
+	Timeout     string `json:"timeout,omitempty"`
+	CanaryGroup string `json:"canary_group,omitempty"`
+	// InsecureSkipVerify is a pointer so PATCH can tell "not mentioned"
+	// (keep the current value) apart from an explicit false (turn it off).
+	InsecureSkipVerify *bool `json:"insecure_skip_verify,omitempty"`
+	// ThinkingEnabled is a pointer for the same PATCH reason as
+	// InsecureSkipVerify: absent means "keep the stored value".
+	ThinkingEnabled *bool                   `json:"thinking_enabled,omitempty"`
+	Notify          notifyPayload           `json:"notify"`
+	OpenAI          *config.OpenAIConfig    `json:"openai,omitempty"`
+	Anthropic       *config.AnthropicConfig `json:"anthropic,omitempty"`
+	Gemini          *config.GeminiConfig    `json:"gemini,omitempty"`
 }
 
 type notifyPayload struct {
-	Enabled     bool   `json:"enabled"`
-	Channel     string `json:"channel,omitempty"`
+	Enabled      bool   `json:"enabled"`
+	Channel      string `json:"channel,omitempty"`
 	WeComWebhook string `json:"wecom_webhook,omitempty"`
 }
 
 // taskResponse is the JSON shape returned to clients — secrets are
 // guaranteed absent regardless of what the store has on disk.
 type taskResponse struct {
-	ID         string            `json:"id"`
-	Name       string            `json:"name"`
-	Enabled    bool              `json:"enabled"`
-	Protocol   string            `json:"protocol"`
-	BaseURL    string            `json:"base_url"`
-	Model      string            `json:"model"`
-	SystemPrompt string          `json:"system_prompt"`
-	UserPrompt string            `json:"user_prompt"`
-	PromptVars map[string]string `json:"prompt_vars"`
-	Schedule   string            `json:"schedule"`
-	Timeout    string            `json:"timeout"`
-	CanaryGroup string           `json:"canary_group"`
-	Notify     notifyView        `json:"notify"`
-	OpenAI     *config.OpenAIConfig    `json:"openai,omitempty"`
-	Anthropic  *config.AnthropicConfig `json:"anthropic,omitempty"`
-	Gemini     *config.GeminiConfig    `json:"gemini,omitempty"`
-	HasAPIKey  bool              `json:"has_api_key"`
-	CreatedAt  time.Time         `json:"created_at"`
-	UpdatedAt  time.Time         `json:"updated_at"`
+	ID           string            `json:"id"`
+	Name         string            `json:"name"`
+	Enabled      bool              `json:"enabled"`
+	Protocol     string            `json:"protocol"`
+	BaseURL      string            `json:"base_url"`
+	Model        string            `json:"model"`
+	SystemPrompt string            `json:"system_prompt"`
+	UserPrompt   string            `json:"user_prompt"`
+	PromptVars   map[string]string `json:"prompt_vars"`
+	Schedule     string            `json:"schedule"`
+	Timeout      string            `json:"timeout"`
+	CanaryGroup  string            `json:"canary_group"`
+	// InsecureSkipVerify is the per-task TLS switch.
+	InsecureSkipVerify bool `json:"insecure_skip_verify"`
+	// InsecureSkipVerifyGlobal reports the instance-wide switch. When true
+	// the per-task flag is irrelevant — every probe skips verification.
+	InsecureSkipVerifyGlobal bool `json:"insecure_skip_verify_global"`
+	// ThinkingEnabled is the per-task reasoning-trace switch.
+	ThinkingEnabled bool                    `json:"thinking_enabled"`
+	Notify          notifyView              `json:"notify"`
+	OpenAI          *config.OpenAIConfig    `json:"openai,omitempty"`
+	Anthropic       *config.AnthropicConfig `json:"anthropic,omitempty"`
+	Gemini          *config.GeminiConfig    `json:"gemini,omitempty"`
+	HasAPIKey       bool                    `json:"has_api_key"`
+	// SecretError is non-empty when this task's stored secrets could not
+	// be decrypted with the current master key. The task is still listed
+	// so it can be repaired (re-enter the api key); until then it has no
+	// usable credentials.
+	SecretError string    `json:"secret_error,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+	UpdatedAt   time.Time `json:"updated_at"`
 }
 
 type notifyView struct {
-	Enabled      bool   `json:"enabled"`
-	Channel      string `json:"channel"`
-	HasWebhook   bool   `json:"has_webhook"`
+	Enabled    bool   `json:"enabled"`
+	Channel    string `json:"channel"`
+	HasWebhook bool   `json:"has_webhook"`
 }
 
 // redactTask strips secrets from t so we never leak api_key / webhook.
-func redactTask(t config.TaskConfig) taskResponse {
+//
+// It's a method rather than a free function because the response carries the
+// instance-wide TLS switch, which lives on the handler config.
+func (h *AdminTaskHandlers) redactTask(t config.TaskConfig) taskResponse {
 	if t.PromptVars == nil {
 		t.PromptVars = map[string]string{}
 	}
 	return taskResponse{
-		ID:           t.ID,
-		Name:         t.Name,
-		Enabled:      t.Enabled,
-		Protocol:     string(t.Protocol),
-		BaseURL:      t.BaseURL,
-		Model:        t.Model,
-		SystemPrompt: t.SystemPrompt,
-		UserPrompt:   t.UserPrompt,
-		PromptVars:   t.PromptVars,
-		Schedule:     t.Schedule,
-		Timeout:      t.EffectiveTimeout().String(),
-		CanaryGroup:  t.CanaryGroup,
+		ID:                       t.ID,
+		Name:                     t.Name,
+		Enabled:                  t.Enabled,
+		Protocol:                 string(t.Protocol),
+		BaseURL:                  t.BaseURL,
+		Model:                    t.Model,
+		SystemPrompt:             t.SystemPrompt,
+		UserPrompt:               t.UserPrompt,
+		PromptVars:               t.PromptVars,
+		Schedule:                 t.Schedule,
+		Timeout:                  t.EffectiveTimeout().String(),
+		CanaryGroup:              t.CanaryGroup,
+		InsecureSkipVerify:       t.InsecureSkipVerify,
+		InsecureSkipVerifyGlobal: h.cfg.InsecureSkipVerify,
+		ThinkingEnabled:          t.ThinkingEnabled,
 		Notify: notifyView{
 			Enabled:    t.Notify.Enabled,
 			Channel:    string(t.Notify.Channel),
 			HasWebhook: len(t.Notify.WeComWebhookEnc) > 0 || t.Notify.WeComWebhook != "",
 		},
-		OpenAI:     t.OpenAI,
-		Anthropic:  t.Anthropic,
-		Gemini:     t.Gemini,
-		HasAPIKey:  len(t.APIKeyEnc) > 0 || t.APIKey != "",
-		CreatedAt:  t.CreatedAt,
-		UpdatedAt:  t.UpdatedAt,
+		OpenAI:      t.OpenAI,
+		Anthropic:   t.Anthropic,
+		Gemini:      t.Gemini,
+		HasAPIKey:   len(t.APIKeyEnc) > 0 || t.APIKey != "",
+		SecretError: t.SecretError,
+		CreatedAt:   t.CreatedAt,
+		UpdatedAt:   t.UpdatedAt,
 	}
 }
 
@@ -277,7 +371,7 @@ func (h *AdminTaskHandlers) create(w http.ResponseWriter, r *http.Request) {
 		stored.APIKeyEnc = nil
 		stored.Notify.WeComWebhook = ""
 		stored.Notify.WeComWebhookEnc = nil
-		resp := redactTask(*stored)
+		resp := h.redactTask(*stored)
 		resp.HasAPIKey = hasKey
 		resp.Notify.HasWebhook = hasHook
 		writeJSON(w, http.StatusCreated, resp)
@@ -324,7 +418,7 @@ func (h *AdminTaskHandlers) patch(w http.ResponseWriter, r *http.Request) {
 		stored.APIKeyEnc = nil
 		stored.Notify.WeComWebhook = ""
 		stored.Notify.WeComWebhookEnc = nil
-		resp := redactTask(*stored)
+		resp := h.redactTask(*stored)
 		resp.HasAPIKey = hasKey
 		resp.Notify.HasWebhook = hasHook
 		writeJSON(w, http.StatusOK, resp)
@@ -381,7 +475,7 @@ func (h *AdminTaskHandlers) start(w http.ResponseWriter, r *http.Request) {
 	}
 	if existing.Enabled {
 		// Idempotent — already running.
-		respondStoredTask(w, http.StatusOK, existing)
+		h.respondStoredTask(w, http.StatusOK, existing)
 		return
 	}
 	// Stop here wraps in a store context with a small timeout so a slow
@@ -400,7 +494,7 @@ func (h *AdminTaskHandlers) start(w http.ResponseWriter, r *http.Request) {
 		WriteAPIError(w, http.StatusInternalServerError, "start_schedule_failed", err.Error())
 		return
 	}
-	respondStoredTask(w, http.StatusOK, existing)
+	h.respondStoredTask(w, http.StatusOK, existing)
 }
 
 // stop retracts the task's cron entry first (so even a transient DB error
@@ -435,7 +529,7 @@ func (h *AdminTaskHandlers) stop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if !existing.Enabled {
-		respondStoredTask(w, http.StatusOK, existing)
+		h.respondStoredTask(w, http.StatusOK, existing)
 		return
 	}
 	storeCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
@@ -445,12 +539,12 @@ func (h *AdminTaskHandlers) stop(w http.ResponseWriter, r *http.Request) {
 		WriteAPIError(w, http.StatusInternalServerError, "stop_persist_failed", err.Error())
 		return
 	}
-	respondStoredTask(w, http.StatusOK, existing)
+	h.respondStoredTask(w, http.StatusOK, existing)
 }
 
 // respondStoredTask serialises a task via redactTask + has-* flags, sharing
 // the same nil-ciphertext-before-capture discipline as list/get/create/patch.
-func respondStoredTask(w http.ResponseWriter, status int, stored *config.TaskConfig) {
+func (h *AdminTaskHandlers) respondStoredTask(w http.ResponseWriter, status int, stored *config.TaskConfig) {
 	if stored == nil {
 		writeJSON(w, status, map[string]any{"ok": true})
 		return
@@ -461,7 +555,7 @@ func respondStoredTask(w http.ResponseWriter, status int, stored *config.TaskCon
 	stored.APIKeyEnc = nil
 	stored.Notify.WeComWebhook = ""
 	stored.Notify.WeComWebhookEnc = nil
-	resp := redactTask(*stored)
+	resp := h.redactTask(*stored)
 	resp.HasAPIKey = hasKey
 	resp.Notify.HasWebhook = hasHook
 	writeJSON(w, status, resp)
@@ -516,20 +610,36 @@ func payloadToTaskConfig(p taskPayload, existingID string) (*config.TaskConfig, 
 	if channel == "" {
 		channel = string(config.NotifyWeCom)
 	}
+	// TLS verification switch. Nil means "not specified" — for POST that
+	// resolves to the safe default (verification on); for PATCH the merge
+	// step fills in the existing value before we get here.
+	insecureSkipVerify := false
+	if p.InsecureSkipVerify != nil {
+		insecureSkipVerify = *p.InsecureSkipVerify
+	}
+	// Thinking switch — nil means "not specified"; resolves to off (the
+	// safe default: no thinking parameter on the wire) for POST. The PATCH
+	// merge step fills in the existing value before we get here.
+	thinkingEnabled := false
+	if p.ThinkingEnabled != nil {
+		thinkingEnabled = *p.ThinkingEnabled
+	}
 	tc := &config.TaskConfig{
-		ID:           existingID,
-		Name:         p.Name,
-		Enabled:      enabled,
-		Protocol:     config.Protocol(p.Protocol),
-		BaseURL:      p.BaseURL,
-		APIKey:       p.APIKey,
-		Model:        p.Model,
-		SystemPrompt: p.SystemPrompt,
-		UserPrompt:   p.UserPrompt,
-		PromptVars:   p.PromptVars,
-		Schedule:     p.Schedule,
-		Timeout:      timeout,
-		CanaryGroup:  p.CanaryGroup,
+		ID:                 existingID,
+		Name:               p.Name,
+		Enabled:            enabled,
+		Protocol:           config.Protocol(p.Protocol),
+		BaseURL:            p.BaseURL,
+		APIKey:             p.APIKey,
+		Model:              p.Model,
+		SystemPrompt:       p.SystemPrompt,
+		UserPrompt:         p.UserPrompt,
+		PromptVars:         p.PromptVars,
+		Schedule:           p.Schedule,
+		Timeout:            timeout,
+		CanaryGroup:        p.CanaryGroup,
+		InsecureSkipVerify: insecureSkipVerify,
+		ThinkingEnabled:    thinkingEnabled,
 		Notify: config.NotifyConfig{
 			Enabled:      p.Notify.Enabled,
 			Channel:      config.NotifyChannel(channel),
@@ -578,7 +688,22 @@ func mergeTaskConfig(existing *config.TaskConfig, p taskPayload) (*config.TaskCo
 		p.PromptVars = existing.PromptVars
 	}
 	if p.Timeout == "" {
-		p.Timeout = existing.Timeout.String()
+		// EffectiveTimeout() falls back to TimeoutMS and then to the 30s
+		// design default. Using the raw Timeout field here would render
+		// "0s" for a task whose duration was never hydrated, and the
+		// payload validator would then reject the whole PATCH.
+		p.Timeout = existing.EffectiveTimeout().String()
+	}
+	// TLS switch — nil means "not mentioned", so keep the stored value.
+	// An explicit false turns verification back on for this task.
+	if p.InsecureSkipVerify == nil {
+		existingVal := existing.InsecureSkipVerify
+		p.InsecureSkipVerify = &existingVal
+	}
+	// Thinking switch — same nil-means-keep convention as the TLS switch.
+	if p.ThinkingEnabled == nil {
+		existingVal := existing.ThinkingEnabled
+		p.ThinkingEnabled = &existingVal
 	}
 	// Protocol-specific blocks — apply *per-field* fallback so callers can
 	// update just one knob (e.g. stream_path) without wiping stream_path or

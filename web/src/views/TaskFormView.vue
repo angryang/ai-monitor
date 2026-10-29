@@ -7,6 +7,7 @@ import { useToast } from '../utils/toast'
 import { cron, minLength, required, url } from '../utils/validation'
 import Button from '../components/ui/Button.vue'
 import FormField from '../components/ui/FormField.vue'
+import Switch from '../components/ui/Switch.vue'
 import type { Task, TaskWritePayload } from '../api/tasks'
 
 const { t } = useI18n()
@@ -24,10 +25,12 @@ const form = ref<TaskWritePayload>({
   base_url: '',
   api_key: '',
   model: '',
-  user_prompt: 'Say hi at ${timestamp}',
+  user_prompt: 'Say hi',
   schedule: '*/30 * * * * *',
   timeout: '30s',
   canary_group: 'default',
+  insecure_skip_verify: false,
+  thinking_enabled: false,
   notify: { enabled: false, channel: 'wecom' },
 })
 const errors = ref<Record<string, string>>({})
@@ -62,6 +65,8 @@ function hydrate(t: Task) {
     schedule: t.schedule,
     timeout: t.timeout,
     canary_group: t.canary_group,
+    insecure_skip_verify: t.insecure_skip_verify ?? false,
+    thinking_enabled: t.thinking_enabled ?? false,
     notify: {
       enabled: t.notify.enabled,
       channel: t.notify.channel,
@@ -153,6 +158,26 @@ async function onSubmit() {
       <FormField :label="t('task.form.canary')" id="canary_group">
         <input id="canary_group" v-model="form.canary_group" type="text" class="text-mono" />
       </FormField>
+      <section class="form__panel form__span">
+        <h3 class="form__panel-title text-mono">{{ t('task.form.tls') }}</h3>
+        <Switch
+          id="insecure_skip_verify"
+          v-model="form.insecure_skip_verify"
+          :label="t('task.form.insecureSkipVerify')"
+          :description="t('task.form.insecureSkipVerifyHint')"
+        />
+      </section>
+
+      <section class="form__panel form__span">
+        <h3 class="form__panel-title text-mono">{{ t('task.form.thinking') }}</h3>
+        <Switch
+          id="thinking_enabled"
+          v-model="form.thinking_enabled"
+          :label="t('task.form.thinkingLabel')"
+          :description="t('task.form.thinkingHint')"
+        />
+      </section>
+
       <FormField :label="t('task.form.userPrompt')" id="user_prompt" required :error="errors.user_prompt" class="form__span">
         <textarea id="user_prompt" v-model="form.user_prompt" rows="3" />
       </FormField>
@@ -160,16 +185,17 @@ async function onSubmit() {
         <textarea id="system_prompt" v-model="form.system_prompt" rows="2" />
       </FormField>
 
-      <fieldset class="form__fieldset form__span">
-        <legend>{{ t('task.form.notification') }}</legend>
-        <label class="form__check">
-          <input v-model="form.notify.enabled" type="checkbox" />
-          <span>{{ t('task.form.notifyEnabled') }}</span>
-        </label>
+      <section class="form__panel form__span">
+        <h3 class="form__panel-title text-mono">{{ t('task.form.notification') }}</h3>
+        <Switch
+          id="notify_enabled"
+          v-model="form.notify.enabled"
+          :label="t('task.form.notifyEnabled')"
+        />
         <FormField :label="t('task.form.wecom')" id="wecom" :hint="isEdit ? t('task.form.wecomHint') : ''">
           <input id="wecom" v-model="form.notify.wecom_webhook" type="text" class="text-mono" />
         </FormField>
-      </fieldset>
+      </section>
 
       <div class="form__actions form__span">
         <Button type="submit" :loading="submitting">{{ isEdit ? t('task.form.submitSave') : t('task.form.submitCreate') }}</Button>
@@ -187,23 +213,23 @@ async function onSubmit() {
   gap: var(--space-4);
 }
 .form__span { grid-column: span 2; }
-.form__fieldset {
-  border: 1px solid var(--border);
+/* 区块面板与 FormField 的输入控件同一视觉语言：
+   surface-2 底 + border-strong 边框 + radius-md 圆角 */
+.form__panel {
+  border: 1px solid var(--border-strong);
   border-radius: var(--radius-md);
-  padding: var(--space-4);
+  background: var(--surface-2);
+  padding: var(--space-3) var(--space-4);
   display: flex;
   flex-direction: column;
-  gap: var(--space-3);
-  background: var(--surface);
+  gap: var(--space-2);
 }
-.form__fieldset legend {
-  padding: 0 var(--space-2);
-  color: var(--muted);
-  font-family: var(--font-mono);
+.form__panel-title {
+  margin: 0;
   font-size: var(--fs-11);
   letter-spacing: 0.06em;
   text-transform: uppercase;
+  color: var(--muted);
 }
-.form__check { display: flex; align-items: center; gap: var(--space-2); font-size: var(--fs-13); }
 .form__actions { display: flex; gap: var(--space-3); }
 </style>

@@ -120,7 +120,13 @@ func TestAdminListTasks_RedactsSecrets(t *testing.T) {
 		t.Fatalf("webhook leaked: %s", string(body))
 	}
 	var parsed struct {
-		Tasks []config.TaskConfig `json:"tasks"`
+		// The wire format uses camelCase-ish snake_case keys and renders
+		// timeout as a human-readable string, so decode into a loose
+		// shape rather than config.TaskConfig.
+		Tasks []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"tasks"`
 	}
 	if err := json.Unmarshal(body, &parsed); err != nil {
 		t.Fatalf("unmarshal: %v", err)

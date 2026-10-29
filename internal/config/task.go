@@ -85,28 +85,57 @@ func (TaskConfig) TableName() string { return TaskConfigTableName }
 // column-flattening by default; we still surround them with `,embedded` so
 // future schema migrations treat them uniformly.
 type TaskConfig struct {
-	ID             string `gorm:"primaryKey;size:64" yaml:"id"`
-	Name           string `gorm:"uniqueIndex;size:128;not null" yaml:"name" validate:"required,min=1,max=128"`
-	Enabled        bool   `gorm:"not null;default:true" yaml:"enabled"`
-	Protocol       Protocol `gorm:"size:32;not null" yaml:"protocol" validate:"required,oneof=openai anthropic gemini"`
-	BaseURL        string `gorm:"size:512;not null" yaml:"base_url" validate:"required,url"`
-	APIKey         string `gorm:"-"` // runtime only; loaded by store
-	APIKeyEnc      []byte `gorm:"column:api_key_enc;type:blob"`
-	Model          string `gorm:"size:128;not null" yaml:"model" validate:"required"`
-	SystemPrompt   string `gorm:"type:text" yaml:"system_prompt,omitempty"`
-	UserPrompt     string `gorm:"type:text" yaml:"user_prompt" validate:"required"`
+	ID       string   `gorm:"primaryKey;size:64" yaml:"id"`
+	Name     string   `gorm:"uniqueIndex;size:128;not null" yaml:"name" validate:"required,min=1,max=128"`
+	Enabled  bool     `gorm:"not null;default:true" yaml:"enabled"`
+	Protocol Protocol `gorm:"size:32;not null" yaml:"protocol" validate:"required,oneof=openai anthropic gemini"`
+	BaseURL  string   `gorm:"size:512;not null" yaml:"base_url" validate:"required,url"`
+	// InsecureSkipVerify disables upstream TLS certificate verification
+	// for this task. Needed when the endpoint presents a self-signed cert
+	// or a cert signed by a private CA the host doesn't trust (typical for
+	// in-cluster gateways / internal model servers).
+	//
+	// It is OR'ed with the instance-wide switch (Config.InsecureSkipVerify),
+	// so an operator who turned the global switch on cannot re-enable
+	// verification for a single task — the global switch is an explicit
+	// "this deployment does not verify certs" decision.
+	//
+	// Security note: skipping verification means the connection is
+	// vulnerable to MITM. Keep it off unless the endpoint is on a trusted
+	// network path.
+	InsecureSkipVerify bool `gorm:"column:insecure_skip_verify;not null;default:false" yaml:"insecure_skip_verify,omitempty"`
+	// ThinkingEnabled asks the upstream model to emit its reasoning trace
+	// on this task's probes. Each protocol adapter maps the flag to its
+	// own request shape (openai: `enable_thinking`, anthropic: `thinking`
+	// block, gemini: `thinkingConfig`). When false the adapter sends NO
+	// thinking parameter at all, so wire behaviour is identical to the
+	// pre-flag behaviour — the upstream default applies.
+	ThinkingEnabled bool   `gorm:"column:thinking_enabled;not null;default:false" yaml:"thinking_enabled,omitempty"`
+	APIKey          string `gorm:"-"` // runtime only; loaded by store
+	APIKeyEnc       []byte `gorm:"column:api_key_enc;type:blob"`
+	// SecretError records why this row's encrypted secrets could not be
+	// opened (almost always a master key mismatch). Runtime-only: never
+	// persisted, never returned to the browser verbatim.
+	//
+	// When set, APIKey / Notify.WeComWebhook stay empty and the task is
+	// surfaced to the admin UI so an operator can re-enter the secret
+	// instead of losing the whole task definition.
+	SecretError    string            `gorm:"-" json:"-"`
+	Model          string            `gorm:"size:128;not null" yaml:"model" validate:"required"`
+	SystemPrompt   string            `gorm:"type:text" yaml:"system_prompt,omitempty"`
+	UserPrompt     string            `gorm:"type:text" yaml:"user_prompt" validate:"required"`
 	PromptVars     map[string]string `gorm:"-" yaml:"prompt_vars,omitempty"` // runtime: decoded from PromptVarsJSON
-	PromptVarsJSON string `gorm:"column:prompt_vars;type:text"`              // persistent JSON form
-	Schedule       string `gorm:"size:128;not null" yaml:"schedule" validate:"required"`
-	Timeout        time.Duration `gorm:"-" yaml:"timeout" validate:"min=1s,max=10m"`
-	TimeoutMS      int64  `gorm:"column:timeout_ms;not null;default:30000"`
-	CanaryGroup  string            `gorm:"size:64;not null;default:default" yaml:"canary_group,omitempty"`
-	Notify       NotifyConfig      `gorm:"embedded" yaml:"notify,omitempty"`
-	OpenAI       *OpenAIConfig     `gorm:"embedded" yaml:"openai,omitempty"`
-	Anthropic    *AnthropicConfig  `gorm:"embedded" yaml:"anthropic,omitempty"`
-	Gemini       *GeminiConfig     `gorm:"embedded" yaml:"gemini,omitempty"`
-	CreatedAt    time.Time         `gorm:"autoCreateTime"`
-	UpdatedAt    time.Time         `gorm:"autoUpdateTime"`
+	PromptVarsJSON string            `gorm:"column:prompt_vars;type:text"`   // persistent JSON form
+	Schedule       string            `gorm:"size:128;not null" yaml:"schedule" validate:"required"`
+	Timeout        time.Duration     `gorm:"-" yaml:"timeout" validate:"min=1s,max=10m"`
+	TimeoutMS      int64             `gorm:"column:timeout_ms;not null;default:30000"`
+	CanaryGroup    string            `gorm:"size:64;not null;default:default" yaml:"canary_group,omitempty"`
+	Notify         NotifyConfig      `gorm:"embedded" yaml:"notify,omitempty"`
+	OpenAI         *OpenAIConfig     `gorm:"embedded" yaml:"openai,omitempty"`
+	Anthropic      *AnthropicConfig  `gorm:"embedded" yaml:"anthropic,omitempty"`
+	Gemini         *GeminiConfig     `gorm:"embedded" yaml:"gemini,omitempty"`
+	CreatedAt      time.Time         `gorm:"autoCreateTime"`
+	UpdatedAt      time.Time         `gorm:"autoUpdateTime"`
 }
 
 // NotifyConfig is the embedded notification block.
@@ -128,6 +157,28 @@ func (t *TaskConfig) EffectiveTimeout() time.Duration {
 		return time.Duration(t.TimeoutMS) * time.Millisecond
 	}
 	return 30 * time.Second
+}
+
+// Runnable reports whether the task can actually be probed.
+//
+// A task whose encrypted secrets could not be decrypted (SecretError set)
+// carries an empty api key, so probing it would fail on every tick and
+// spam the notification channel. Such tasks are still listed in the admin
+// UI — they just stay out of the scheduler until the secret is re-entered.
+func (t *TaskConfig) Runnable() bool {
+	return t.SecretError == ""
+}
+
+// RunnableTasks filters a task list down to the tasks that can be probed.
+// Used before handing tasks to the scheduler.
+func RunnableTasks(tasks []TaskConfig) []TaskConfig {
+	out := make([]TaskConfig, 0, len(tasks))
+	for _, t := range tasks {
+		if t.Runnable() {
+			out = append(out, t)
+		}
+	}
+	return out
 }
 
 // Normalise pulls Duration / map fields into the persistent integer / JSON

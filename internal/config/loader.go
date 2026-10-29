@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -75,6 +76,14 @@ type Config struct {
 	BucketsITL      []float64 `yaml:"buckets_itl"`
 	BucketsDuration []float64 `yaml:"buckets_duration"`
 	BucketsLag      []float64 `yaml:"buckets_lag"`
+	// InsecureSkipVerify disables upstream TLS certificate verification for
+	// every probe, regardless of the per-task setting. It exists for
+	// deployments that only talk to internal endpoints (self-signed certs
+	// or a private CA) and want one switch instead of per-task opt-ins.
+	//
+	// Security note: skipping verification removes MITM protection. Prefer
+	// the per-task TaskConfig.InsecureSkipVerify where possible.
+	InsecureSkipVerify bool `yaml:"insecure_skip_verify"`
 	// Tasks lists tasks initially seeded into SQLite. Optional.
 	Tasks []TaskConfig `yaml:"tasks"`
 }
@@ -129,6 +138,9 @@ type FlagOverrides struct {
 	SuccessRateW     int
 	SuccessRateThr   float64
 	DedupTTL         time.Duration
+	// InsecureSkipVerify is a pointer because a plain bool can't express
+	// "not passed" vs "explicitly false". Nil means "no override".
+	InsecureSkipVerify *bool
 }
 
 // zeroFromDefaults clones the package defaults into a fresh Config.
@@ -177,6 +189,11 @@ func applyEnv(c *Config) {
 			c.SlowThreshold = d
 		}
 	}
+	if v := os.Getenv("AI_MONITOR_INSECURE_SKIP_VERIFY"); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			c.InsecureSkipVerify = b
+		}
+	}
 }
 
 func applyFlagOverrides(c *Config, f FlagOverrides) {
@@ -209,6 +226,9 @@ func applyFlagOverrides(c *Config, f FlagOverrides) {
 	}
 	if f.DedupTTL > 0 {
 		c.DedupTTL = f.DedupTTL
+	}
+	if f.InsecureSkipVerify != nil {
+		c.InsecureSkipVerify = *f.InsecureSkipVerify
 	}
 }
 

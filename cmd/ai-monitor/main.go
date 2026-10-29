@@ -51,10 +51,14 @@ func run() error {
 	var (
 		yamlPath = flag.String("config", "deploy/example.config.yaml", "path to YAML config")
 		addr     = flag.String("addr", "", "HTTP listen addr (overrides config)")
+		insecure = flag.Bool("insecure-skip-verify", false, "skip upstream TLS certificate verification for all probes (overrides config)")
 	)
 	flag.Parse()
 
-	cfg, err := config.Load(*yamlPath, config.FlagOverrides{HTTPAddr: *addr})
+	cfg, err := config.Load(*yamlPath, config.FlagOverrides{
+		HTTPAddr:           *addr,
+		InsecureSkipVerify: insecure,
+	})
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
@@ -117,7 +121,11 @@ func run() error {
 	weCom := wecom.New(wecom.Config{WebhookURL: "http://localhost", Timeout: 5 * time.Second})
 	multi := notifier.NewMultiNotifier(weCom)
 
-	protocol.SetDeps(protocol.AdapterDeps{})
+	// The instance-wide InsecureSkipVerify switch lives in the adapter deps
+	// because the adapters are the layer that owns the HTTP client. Per-task
+	// opt-ins ride along on TaskConfig and are OR'ed with this flag inside
+	// protocol.ClientFor.
+	protocol.SetDeps(protocol.AdapterDeps{InsecureSkipVerify: cfg.InsecureSkipVerify})
 
 	runner := probe.NewRunner(func(name string) (probe.RunnerAdapter, error) {
 		a, err := protocol.Lookup(name)
@@ -148,11 +156,26 @@ func run() error {
 		},
 	})
 
-	tasks, err := store.ListTasks(ctx)
+	// Lenient load: a task whose encrypted secrets cannot be opened with the
+	// current master key must not take the whole service down. Such tasks
+	// stay in the list (marked with SecretError) so the admin UI can show
+	// them and an operator can re-enter the api key.
+	tasks, secretErrs, err := store.ListTasksLenient(ctx)
 	if err != nil {
+		// The listing itself failed (e.g. the database is unreachable).
+		// Starting anyway would bring up an instance that silently monitors
+		// nothing, so fail fast instead.
 		return fmt.Errorf("list tasks: %w", err)
 	}
-	if err := sched.Reload(ctx, tasks); err != nil {
+	for _, err := range secretErrs {
+		log.Warn("task secrets could not be decrypted; task kept but its api_key is empty until you re-enter it in the admin UI",
+			"error", err.Error())
+	}
+	if len(secretErrs) > 0 {
+		log.Warn("this usually means AI_MONITOR_MASTER_KEY changed since these tasks were saved",
+			"affected_tasks", len(secretErrs))
+	}
+	if err := sched.Reload(ctx, config.RunnableTasks(tasks)); err != nil {
 		return fmt.Errorf("scheduler reload: %w", err)
 	}
 	if err := sched.Start(ctx); err != nil {
@@ -168,11 +191,12 @@ func run() error {
 		Auth:      mw,
 		UserStore: userStore,
 		RunStore:  runStore,
+		InsecureSkipVerify: cfg.InsecureSkipVerify,
 	})
 
 	// Hot reload coordinator.
 	rel := server.NewWatchReloader(store, func(_ context.Context, tasks []config.TaskConfig) error {
-		return sched.Reload(ctx, tasks)
+		return sched.Reload(ctx, config.RunnableTasks(tasks))
 	}, log)
 	relDone := make(chan struct{})
 	go func() {

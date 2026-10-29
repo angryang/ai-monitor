@@ -67,6 +67,7 @@
 | 🌐 enabled | bool | 否 | true | 是否启用 | `true` |
 | 🌐 protocol | enum | 是 | — | `openai` / `anthropic` / `gemini` | `openai` |
 | 🌐 base_url | string | 是 | — | AI 服务 base URL（`url` 校验） | `https://api.openai.com` |
+| 🌐 insecure_skip_verify | bool | 否 | false | 跳过上游 TLS 证书校验（自签名 / 私有 CA 场景）；⚠️ 关闭 MITM 防护 | `true` |
 | 🌐 apikey | string (secret) | 是 | — | 鉴权密钥（DB 加密） | `sk-...` |
 | 🌐 model | string | 是 | — | 模型名 | `gpt-4o` |
 | 🌐 system_prompt | string | 否 | "" | 系统提示，支持 `${var}` | `You are a helpful assistant.` |
@@ -387,6 +388,7 @@ type TaskConfig struct {
     Enabled      bool              `gorm:"not null;default:true"`
     Protocol     Protocol          `gorm:"size:32;not null" validate:"required,oneof=openai anthropic gemini"`
     BaseURL      string            `gorm:"size:512;not null" validate:"required,url"`
+    InsecureSkipVerify bool        `gorm:"column:insecure_skip_verify;not null;default:false" yaml:"insecure_skip_verify,omitempty"` // 跳过上游 TLS 证书校验
     APIKey       string            `gorm:"-"`            // 运行时
     APIKeyEnc    []byte            `gorm:"column:api_key_enc;type:blob"`
     Model        string            `gorm:"size:128;not null" validate:"required"`
@@ -797,6 +799,7 @@ CREATE TABLE tasks (
     enabled         BOOLEAN      NOT NULL DEFAULT 1,
     protocol        VARCHAR(32)  NOT NULL,
     base_url        VARCHAR(512) NOT NULL,
+    insecure_skip_verify BOOLEAN  NOT NULL DEFAULT 0,        -- 跳过上游 TLS 证书校验
     api_key_enc     BLOB,
     model           VARCHAR(128) NOT NULL,
     system_prompt   TEXT,
@@ -1852,6 +1855,135 @@ cmd/ai-monitor/main.go
 - 「按上游 trace id 反查 ai-monitor run」端点：`GET /admin/runs/by-request-id/{id}`
 - 自动 mask：response body 含疑似 secret 字符串（如长 base64 / 数字 API key shape）时部分打码
 - 抓 raw HTTP headers（含 OpenAI 路由 metadata）
+
+---
+
+### 18.14 增量 · 语义化内容（输入 / 思考 / 输出）+ X-Req-Id 常驻展示
+
+> **触发场景**：admin 排查"这次探测到底发了什么、模型回了什么"。§18.13 落的是原始字节（HAR 风格首尾各 4 KiB），取证够用但**读不懂**：一个 401 记录里看不到任何能拿去上游日志里 grep 的线索，一个成功的探测也看不出模型究竟思考了什么、最终答了什么。
+
+#### 18.14.1 目标
+
+- `probe_runs` 新增 5 列：`input_content` / `thinking_content` / `output_content` / `content_truncated` / `response_error_body`
+- 三段语义内容独立成列，admin 直接读，不用自己解析 JSON
+- **X-Req-Id 在每一行常驻可见**（不再只藏在折叠的 Wire capture 里），并带一键复制
+- 失败路径（4xx/5xx）也要留下 X-Req-Id 与上游错误响应体
+
+#### 18.14.2 关键设计决策
+
+| 决策 | 选项 | 选择 | 理由 |
+|---|---|---|---|
+| 内容从哪提取 | 事后从 response_head/tail 反解 / adapter 当下按帧提取 | **adapter 当下按帧提取** | HAR 捕获丢掉中段，跨帧的推理流必然断裂——事后反解拿不到完整 thinking |
+| 输入从哪来 | 解析 request_body / 从 TaskConfig 还原 | **从 TaskConfig 还原** | 三个协议各自拼装请求体，解析要写三套；配置还原保证与实际下发**逐字一致**（共用同一个 ExpandVars） |
+| 思考怎么跨协议统一 | 各协议私有字段 / adapter 内部分流 | **adapter 内部分流到独立累加器** | DeepSeek `reasoning_content`、OpenRouter `reasoning`、Kimi `thinking`、Anthropic `thinking_delta`、Gemini `thought:true` —— 差异全部收敛在 adapter 内 |
+| 推理算不算响应流 | 计入 / 不计入 | **不计入** | chunk 数 / TTFT / ITL 衡量的是"面向用户的响应流"；推理 token 不是。混进去会让三个指标失真 |
+| 每段内容上限 | 不限 / 32 KiB / 16 KiB | **16 KiB** | 够放长 system prompt + 多轮示例 + 完整回答；单行 ~48 KiB，每任务 100 行 ≈ 5 MiB |
+| 截断如何切 | 按字节 / 按 UTF-8 边界 | **按 UTF-8 边界** | 按字节切会切出半个汉字，写进 SQLite / JSON 就是非法字节序列 |
+| X-Req-Id 展示 | 只在折叠区 / 常驻 | **常驻 + 复制按钮** | 用户诉求明确：每次请求都要能一眼看到、方便定位问题 |
+
+#### 18.14.3 数据模型
+
+**`internal/probe/store.go`：ProbeRun 新增 5 列**
+
+```go
+InputContent     string `gorm:"type:text" json:"input_content,omitempty"`
+ThinkingContent  string `gorm:"type:text" json:"thinking_content,omitempty"`
+OutputContent    string `gorm:"type:text" json:"output_content,omitempty"`
+ContentTruncated bool   `gorm:"not null;default:false" json:"content_truncated"`
+ResponseErrorBody string `gorm:"type:text" json:"response_error_body,omitempty"`
+```
+
+GORM AutoMigrate 自动加列；旧 row 新列为 NULL / `false`，无破坏。
+
+**`internal/protocol/content.go`（新增）**
+
+| 符号 | 作用 |
+|---|---|
+| `ExpandVars(s, vars)` | `${var}` 展开——三个 adapter 此前各抄一份，收敛到此处保证"请求体"与"落库输入"一致 |
+| `BuildInput(cfg)` | 渲染 `[system]\n…\n\n[user]\n…` 形式的输入内容 |
+| `TextAccumulator` | 带上限的文本累加器，线程安全，截断到合法 UTF-8 边界 |
+| `ContentCapture` | `ProbeStream` 的附加出口：thinking + 截断标志 |
+| `RequestError` | 携带 `RequestID` / `RequestBody` / `ResponseBody` 的错误类型，`Unwrap` 保持 sentinel 可判定 |
+| `FirstNonEmpty(...)` | 跨厂商 reasoning 字段名兼容 |
+
+**`internal/protocol/adapter.go`：Chunk 与 ProbeStream 扩展**
+
+```go
+type Chunk struct {
+    // ...原有字段...
+    Kind ChunkKind   // 零值 = ChunkContent，既有生产者无需改动
+}
+
+const (
+    ChunkContent  ChunkKind = iota // 面向用户的正文
+    ChunkThinking                   // 模型推理
+)
+
+type ProbeStream interface {
+    // ...原有 6 个方法...
+    ContentCapture() ContentCapture  // §18.14 附加出口
+}
+```
+
+#### 18.14.4 三协议的 thinking 字段对照
+
+| 协议 | 推理载体 | 提取点 |
+|---|---|---|
+| OpenAI 兼容 | `delta.reasoning_content` / `delta.reasoning` / `delta.thinking` | `FirstNonEmpty` 取第一个非空 |
+| Anthropic | `content_block_delta` 且 `delta.thinking` | `thinking_delta` 帧单独分流 |
+| Gemini | `parts[].thought == true` | thought part 单独分流 |
+
+三者的推理内容都**不进入** chunk 流，因此 `chunks` / TTFT / ITL 三个指标语义保持不变。
+
+#### 18.14.5 失败路径的上下文留存
+
+§18.13 之前，401 / 403 / 5xx 这条路径上 `RequestID` **整个丢失**——因为 adapter 在拿到响应前就返回了 error，stream 从未创建。本增量引入 `RequestError`：
+
+```go
+type RequestError struct {
+    RequestID    string
+    RequestBody  []byte
+    ResponseBody string
+    Err          error
+}
+```
+
+- 三个 adapter 在 HTTP 非 2xx 时读走前 4 KiB 错误响应体（上游常把真正原因写在这里：`"Incorrect API key provided"`），包装成 `RequestError` 返回
+- runner 用 `errors.As` 取出 `RequestID` / `RequestBody` / `ResponseBody` 落库
+- `Unwrap` 保证 `errors.Is(err, ErrUnauthorized)` 判定不受影响
+
+#### 18.14.6 附带修复：OpenAI 适配器丢尾帧
+
+`openai.consume()` 里 scanner goroutine 结束（`scanDone`）与 `scanOut` 中残留的终止帧同时就绪时，Go 的 `select` **随机**挑一个——于是终止帧有约一半概率被丢弃。表现为"答案的最后一段偶尔消失"。§18.14 的输出内容依赖 chunk 完整性，故在 `case <-scanDone:` 分支补上 drain 循环。
+
+#### 18.14.7 前端
+
+- `web/src/api/runs.ts`：`ProbeRun` 扩展 5 个字段
+- `web/src/components/runs/RunRow.vue`：
+  - **X-Req-Id 常驻**：行首常驻一枚 mono chip（前 8 字符 + ⌘C 复制按钮，完整值在 `title`）
+  - **内容解析折叠区**：输入 / 思考 / 输出三段，各带 ⌘C 复制；思考用琥珀色左边框、输出用绿色左边框以便区分
+  - **上游错误响应**：失败时在 ERR 行下方单独展示 `response_error_body`
+- `web/src/i18n/locales/{zh-CN,en-US}.json`：补齐 `runs.row.content.*` 等文案
+
+#### 18.14.8 验收（实施时勾）
+
+- [x] `probe_runs` 新增 5 列，AutoMigrate 自动加列且幂等
+- [x] 三协议各自能提取 thinking（OpenAI reasoning_content / Anthropic thinking_delta / Gemini thought part）
+- [x] 输入内容按 `[system]` / `[user]` 分块渲染，prompt 变量已展开
+- [x] 思考内容**不**计入 chunks / TTFT / ITL
+- [x] 401 失败记录里 X-Req-Id 与上游错误体都还在
+- [x] X-Req-Id 在每一行常驻可见 + 一键复制
+- [x] 16 KiB 上限触发时置 `content_truncated`，且截断落在合法 UTF-8 边界
+- [x] `go vet ./...` 干净；`go test -race` 干净（scheduler / server 的既有失败与本增量无关）
+- [x] 前端 `vue-tsc -b` + `vite build` 干净
+
+#### 18.14.9 不在范围内（留 P2）
+
+- 多模态输入（图片 / 音频 part）的渲染
+- 按 X-Req-Id 跨任务关联追踪
+- 「按上游 trace id 反查 ai-monitor run」端点：`GET /admin/runs/by-request-id/{id}`
+- tool_calls / function call 的结构化展示
+- 自动 mask：内容中疑似 secret 的字符串部分打码
 
 ---
 
