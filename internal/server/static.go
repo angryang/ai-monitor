@@ -5,9 +5,10 @@
 // (internal/webui/assets/) and falls back to index.html for unknown
 // routes so the SPA's client-side router takes over.
 //
-// In dev builds (//go:build !prod), the handler instead points at the
-// filesystem under web/dist so live edits show up without a rebuild. The
-// build tag is set by Makefile's web-build target.
+// In dev builds (no -tags=prod), the embed tree is empty, so the handler
+// points at the filesystem under web/dist instead and live edits show up
+// without a rebuild. Production builds (-tags=prod, what `make build` uses)
+// embed the bundle and serve it from the binary.
 package server
 
 import (

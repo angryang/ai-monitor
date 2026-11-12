@@ -1,0 +1,32 @@
+# Keep the Docker build context small and the image reproducible.
+#
+# Anything listed here is NOT copied into the image. The frontend bundle and
+# the SPA embed source are rebuilt inside the image (see the node stage in
+# deploy/Dockerfile) rather than copied from the host.
+
+# --- version control ---
+.git
+.gitignore
+.gitlab-ci.yml
+
+# --- frontend: rebuilt by the node stage ---
+web/node_modules
+web/dist
+web/tsconfig.tsbuildinfo
+
+# --- SPA embed source: produced by the node stage ---
+internal/webui/dist
+
+# --- local build artifacts / runtime state ---
+ai-monitor
+ai-monitor.old*
+ai-monitor.db
+ai-monitor.db-shm
+ai-monitor.db-wal
+.local-secrets
+.local-secrets.tmp.*
+outputs/
+
+# --- large local artifacts ---
+*.tar
+*.pcap

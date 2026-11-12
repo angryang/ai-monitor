@@ -169,11 +169,31 @@ conditions in the Prometheus-native DSL.
 ## Development
 
 ```bash
+make build      # binary with the SPA embedded (builds the SPA first if needed)
+make build-dev  # backend-only binary, no SPA embedded (no Node.js required)
 make test      # -race unit tests
 make test-int  # -race -tags=integration end-to-end tests
 make lint      # go vet
 make docker    # multi-stage scratch image
 ```
+
+### Build tags
+
+The admin SPA is embedded into the binary with `//go:embed`, so the bundle in
+`internal/webui/dist/` must exist at compile time. That tree is a gitignored
+build artifact, so it is produced on demand:
+
+| Build | Command | SPA source | Needs Node.js |
+| --- | --- | --- | --- |
+| production | `make build` | embedded in the binary | yes (only if the bundle is missing) |
+| development | `make build-dev` | `web/dist` on disk, served at runtime | no |
+| tests | `make test` | none | no |
+
+`make build` runs `make web-build` automatically when `internal/webui/dist/` is
+missing, so a fresh checkout builds without extra steps. A plain `go build` or
+`go test ./...` also works on a fresh checkout — those compile without the
+embed and serve the SPA from disk.
+
 
 ## Directory layout (per design.md §10)
 

@@ -171,8 +171,25 @@ if (( NEED_BUILD )); then
     echo "[run-local] FATAL: '$BUILD_REASON' but 'go' is not on PATH" >&2
     exit 4
   fi
+  # The SPA is embedded into the binary (//go:embed, -tags=prod) and lives in
+  # internal/webui/dist — a gitignored build artifact. A fresh checkout has
+  # none, so build it before compiling; if that is impossible (no npm) fall
+  # back to a dev binary that serves the SPA from web/dist at runtime.
+  BUILD_TAGS="-tags=prod"
+  if [[ ! -f internal/webui/dist/index.html ]]; then
+    if command -v npm >/dev/null 2>&1; then
+      echo "[run-local] SPA bundle missing -> building it (npm) ..."
+      if ! make web-build; then
+        echo "[run-local] WARN: SPA build failed -> dev binary (SPA served from web/dist)" >&2
+        BUILD_TAGS=""
+      fi
+    else
+      echo "[run-local] WARN: SPA bundle missing and 'npm' is not on PATH -> dev binary (SPA served from web/dist)" >&2
+      BUILD_TAGS=""
+    fi
+  fi
   echo "[run-local] building ai-monitor from ./cmd/ai-monitor ($BUILD_REASON) ..."
-  go build -o ai-monitor ./cmd/ai-monitor
+  go build $BUILD_TAGS -o ai-monitor ./cmd/ai-monitor
   echo "[run-local] build ok"
 fi
 
