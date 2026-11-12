@@ -45,7 +45,9 @@ func TestScheduler_FiresEntry(t *testing.T) {
 		MaxConcurrent: 4,
 		Handler:       handler,
 	})
-	if err := s.Add(config.TaskConfig{ID: "t1", Schedule: "@every 50ms"}); err != nil {
+	// Enabled must be true: Add() skips disabled tasks, so a zero-value
+	// TaskConfig never registers a cron entry and never fires.
+	if err := s.Add(config.TaskConfig{ID: "t1", Schedule: "@every 50ms", Enabled: true}); err != nil {
 		t.Fatalf("Add: %v", err)
 	}
 	if err := s.Start(context.Background()); err != nil {
@@ -128,7 +130,7 @@ func TestScheduler_Reload(t *testing.T) {
 
 func TestScheduler_InvalidCron(t *testing.T) {
 	s := New(Options{MaxConcurrent: 1, Handler: func(_ context.Context, _ config.TaskConfig) {}})
-	err := s.Add(config.TaskConfig{ID: "t1", Schedule: "not a valid cron"})
+	err := s.Add(config.TaskConfig{ID: "t1", Schedule: "not a valid cron", Enabled: true})
 	if err == nil {
 		t.Fatalf("expected error for invalid cron")
 	}
@@ -147,7 +149,7 @@ func TestScheduler_JitterApplied(t *testing.T) {
 			called.Add(1)
 		},
 	})
-	if err := s.Add(config.TaskConfig{ID: "x", Schedule: "@every 50ms"}); err != nil {
+	if err := s.Add(config.TaskConfig{ID: "x", Schedule: "@every 50ms", Enabled: true}); err != nil {
 		t.Fatalf("Add: %v", err)
 	}
 	_ = s.Start(context.Background())
