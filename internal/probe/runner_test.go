@@ -228,7 +228,7 @@ func (m *memRunStore) ListByTask(_ context.Context, _ string, _ int) ([]ProbeRun
 	return nil, nil
 }
 func (m *memRunStore) Prune(_ context.Context, _ int) error { return nil }
-func (m *memRunStore) Close() error                       { return nil }
+func (m *memRunStore) Close() error                         { return nil }
 
 func newRunnerForTest(a RunnerAdapter, sink metrics.MetricSink, n notifier.Notifier) *Runner {
 	r := NewRunner(func(name string) (RunnerAdapter, error) {
@@ -266,8 +266,18 @@ func TestRunner_TTFT_It_Duration(t *testing.T) {
 	if res.TTFT <= 0 {
 		t.Fatalf("ttft must be > 0")
 	}
-	if res.Duration() <= 0 {
-		t.Fatalf("duration must be > 0")
+	// A stub adapter answers synchronously, so start and end can land in
+	// the same clock tick on a fast machine: Duration() may legitimately
+	// be exactly zero. What must hold is that both timestamps are set and
+	// the interval is never negative.
+	if res.StartedAt.IsZero() || res.EndedAt.IsZero() {
+		t.Fatalf("timestamps must be populated: start=%v end=%v", res.StartedAt, res.EndedAt)
+	}
+	if res.EndedAt.Before(res.StartedAt) {
+		t.Fatalf("ended before it started: %v < %v", res.EndedAt, res.StartedAt)
+	}
+	if res.Duration() < 0 {
+		t.Fatalf("duration must not be negative: %v", res.Duration())
 	}
 }
 
@@ -429,7 +439,7 @@ type flippableAdapter struct {
 	next func() ([]protocol.Chunk, error)
 }
 
-func (f *flippableAdapter) Name() string { return f.name }
+func (f *flippableAdapter) Name() string                      { return f.name }
 func (f *flippableAdapter) Validate(*config.TaskConfig) error { return nil }
 func (f *flippableAdapter) Probe(_ context.Context, _ *config.TaskConfig) (protocol.ProbeStream, error) {
 	chunks, err := f.next()
@@ -450,7 +460,8 @@ func defaultLogForTest() (l *slog.Logger) { return slog.New(slog.NewJSONHandler(
 
 // TestRunner_ProbePersistsSemanticContent verifies §18.14 end-to-end:
 // input / thinking / output are captured on the Result and land in the
-// persisted ProbeRun row.
+// persisted ProbeRun row. It also pins the monitoring-task contract: even
+// if a legacy row carries a system prompt, a scheduled run never sends it.
 func TestRunner_ProbePersistsSemanticContent(t *testing.T) {
 	captured := &memStream{
 		requestID: "rid-content-001",
@@ -475,6 +486,10 @@ func TestRunner_ProbePersistsSemanticContent(t *testing.T) {
 	r.Logger = defaultLogForTest()
 	r.RunStore = runStore
 
+	// A legacy system prompt is present on purpose: the scheduled path must
+	// strip it before both BuildInput and the adapter see the config.
+	var sentSystem string
+	adapter.cfgHook = func(cfg *config.TaskConfig) { sentSystem = cfg.SystemPrompt }
 	task := config.TaskConfig{
 		ID: "c", Name: "c", Protocol: config.ProtocolOpenAI, Enabled: true,
 		BaseURL: "https://e.test", Model: "x",
@@ -483,8 +498,11 @@ func TestRunner_ProbePersistsSemanticContent(t *testing.T) {
 	}
 	res := r.Run(context.Background(), task)
 
-	if !strings.Contains(res.InputContent, "[system]\n你是助手") {
-		t.Fatalf("InputContent = %q", res.InputContent)
+	if strings.Contains(res.InputContent, "[system]") {
+		t.Fatalf("scheduled run must not render a system block: %q", res.InputContent)
+	}
+	if sentSystem != "" {
+		t.Fatalf("adapter received system prompt %q on a scheduled run", sentSystem)
 	}
 	if !strings.Contains(res.InputContent, "[user]\n你好") {
 		t.Fatalf("InputContent = %q", res.InputContent)
@@ -522,6 +540,30 @@ func TestRunner_ProbePersistsSemanticContent(t *testing.T) {
 	}
 }
 
+// TestRunner_ManualRunKeepsSystemPrompt pins the other half of the
+// contract: AI request groups author complete requests, so their one-shot
+// manual runs still send a system prompt. Only scheduled runs strip it.
+func TestRunner_ManualRunKeepsSystemPrompt(t *testing.T) {
+	var sent config.TaskConfig
+	adapter := okAdapter()
+	adapter.cfgHook = func(cfg *config.TaskConfig) { sent = *cfg }
+	r := newRunnerForTest(adapter, metrics.NewPromSink(metrics.PrometheusOptions{}), nil)
+
+	task := manualTask()
+	task.SystemPrompt = "你是助手"
+	res := r.RunManual(context.Background(), task, RunOptions{AIRequestID: "req_1"})
+
+	if sent.SystemPrompt != "你是助手" {
+		t.Fatalf("manual run dropped the system prompt: %q", sent.SystemPrompt)
+	}
+	if !strings.Contains(res.InputContent, "[system]\n你是助手") {
+		t.Fatalf("manual InputContent = %q", res.InputContent)
+	}
+	if res.Source != SourceManual {
+		t.Fatalf("Source = %q, want %q", res.Source, SourceManual)
+	}
+}
+
 // TestRunner_ProbeFailureKeepsRequestID verifies §18.14: a failed probe
 // must still record the X-Req-Id and the upstream error body, otherwise
 // the most interesting failures leave no trace to chase.
@@ -530,6 +572,7 @@ func TestRunner_ProbeFailureKeepsRequestID(t *testing.T) {
 		"rid-fail-401",
 		[]byte(`{"model":"x"}`),
 		`{"error":{"message":"Incorrect API key provided"}}`,
+		401,
 		fmt.Errorf("openai: status 401: %w", protocol.ErrUnauthorized),
 	)
 	adapter := &stubAdapter{name: "openai", err: reqErr}

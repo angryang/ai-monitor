@@ -103,7 +103,7 @@ func TestFirstNonEmpty(t *testing.T) {
 
 func TestRequestError_UnwrapsToSentinel(t *testing.T) {
 	inner := fmt.Errorf("openai: status 401: %w", ErrUnauthorized)
-	err := NewRequestError("rid-1", []byte(`{}`), "boom", inner)
+	err := NewRequestError("rid-1", []byte(`{}`), "boom", 401, inner)
 	// Error() renders the wrapped cause, not the response body.
 	if !strings.Contains(err.Error(), "status 401") {
 		t.Fatalf("Error() = %q", err.Error())

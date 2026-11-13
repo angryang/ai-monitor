@@ -24,15 +24,24 @@ function tt(key: string, params?: Record<string, unknown>): string {
 export interface ApiErrorPayload {
   code: string
   message: string
+  /**
+   * Structured context about the failure — the verdict of a provider
+   * connectivity check, for instance. Present only when the server
+   * attached something beyond the message.
+   */
+  details?: unknown
 }
 
 export class ApiError extends Error {
   status: number
   code: string
-  constructor(status: number, code: string, message: string) {
+  /** Structured context about the failure, when the server sent any. */
+  details?: unknown
+  constructor(status: number, code: string, message: string, details?: unknown) {
     super(message)
     this.status = status
     this.code = code
+    this.details = details
     this.name = 'ApiError'
   }
 }
@@ -109,6 +118,7 @@ export async function apiFetch<T>(path: string, opts: RequestOptions = {}): Prom
       res.status,
       err?.code ?? `http_${res.status}`,
       err?.message ?? text ?? res.statusText,
+      err?.details,
     )
   }
   return payload as T

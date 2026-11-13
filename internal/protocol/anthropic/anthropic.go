@@ -178,7 +178,7 @@ func (a *Adapter) Probe(ctx context.Context, cfg *config.TaskConfig) (protocol.P
 		cancel()
 		// §18.14 — keep the X-Req-Id attached to the failure so admins can
 		// grep the upstream logs for this exact attempt.
-		return nil, protocol.NewRequestError(rid, savedBody, "",
+		return nil, protocol.NewRequestError(rid, savedBody, "", 0,
 			fmt.Errorf("anthropic: do: %w: %w", err, protocol.ErrUpstreamDown))
 	}
 	if cerr := protocol.ClassifyHTTPStatus(resp.StatusCode); cerr != nil {
@@ -186,7 +186,7 @@ func (a *Adapter) Probe(ctx context.Context, cfg *config.TaskConfig) (protocol.P
 		errBody := protocol.ReadErrorBody(resp.Body, protocol.DefaultErrorBodyCapture)
 		_ = resp.Body.Close()
 		cancel()
-		return nil, protocol.NewRequestError(rid, savedBody, errBody,
+		return nil, protocol.NewRequestError(rid, savedBody, errBody, resp.StatusCode,
 			fmt.Errorf("anthropic: status %d: %w", resp.StatusCode, cerr))
 	}
 	cap := protocol.NewRespCapture(protocol.DefaultRespHeadCapture, protocol.DefaultRespTailCapture)

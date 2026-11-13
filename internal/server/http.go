@@ -18,6 +18,8 @@ import (
 	"github.com/angryang/ai-monitor/internal/config"
 	"github.com/angryang/ai-monitor/internal/metrics"
 	"github.com/angryang/ai-monitor/internal/probe"
+	"github.com/angryang/ai-monitor/internal/provider"
+	"github.com/angryang/ai-monitor/internal/request"
 	"github.com/angryang/ai-monitor/internal/scheduler"
 )
 
@@ -48,6 +50,10 @@ type Options struct {
 	Scheduler scheduler.Scheduler
 	Logger    LoggerFunc
 	Timeout   time.Duration
+	// WriteTimeout bounds how long a response may take. It defaults to
+	// Timeout, but the admin API performs outbound calls whose deadline
+	// is longer than a typical request, so callers can raise it.
+	WriteTimeout time.Duration
 
 	// Auth is the JWT + RBAC middleware. When non-nil, /auth/* and the
 	// admin/user routes get wrapped with it. Leaving it nil preserves the
@@ -64,6 +70,22 @@ type Options struct {
 	// RunStore backs the /admin/tasks/{id}/runs endpoint. Optional; if
 	// nil the endpoint returns 503 so admins know history is disabled.
 	RunStore probe.RunStore
+	// RequestStore backs the AI request manager (the flat registry of
+	// predefined AI requests). Optional; if nil those routes return 503.
+	RequestStore request.Store
+	// RequestService executes the AI request manager batches. Optional;
+	// if nil the run routes return 503.
+	RequestService *request.Service
+	// ProviderStore backs the AI service provider registry. Optional; if
+	// nil the provider routes return 503.
+	ProviderStore provider.Store
+	// ProviderChecker verifies that a provider is reachable. Optional;
+	// if nil the provider write routes return 503 — a provider can
+	// never be saved unverified.
+	ProviderChecker ProviderChecker
+	// ProviderCheckTimeout bounds one connectivity check. Optional;
+	// defaults to provider.DefaultCheckTimeout.
+	ProviderCheckTimeout time.Duration
 }
 
 // LoggerFunc matches the slog.Logger style signature used inside handler
@@ -137,12 +159,21 @@ func New(opts Options) *Server {
 	if timeout == 0 {
 		timeout = 5 * time.Second
 	}
+	// The admin API performs outbound calls — the AI provider
+	// connectivity check is part of the provider save path — so the
+	// response deadline is allowed to exceed the generic request
+	// timeout. Without this a provider write would be cut off
+	// mid-flight exactly when the upstream is slow to answer.
+	writeTimeout := opts.WriteTimeout
+	if writeTimeout == 0 {
+		writeTimeout = timeout
+	}
 	hs := &http.Server{
 		Addr:              addr,
 		Handler:           withRequestLog(mux, logf),
 		ReadHeaderTimeout: timeout,
 		ReadTimeout:       timeout,
-		WriteTimeout:      timeout,
+		WriteTimeout:      writeTimeout,
 		IdleTimeout:       2 * timeout,
 	}
 	s.httpServer = hs
@@ -226,6 +257,10 @@ func (s *Server) buildAdminRoutes(opts Options) http.Handler {
 		Cipher:    opts.Cipher,
 		RunStore:  opts.RunStore,
 		Scheduler: opts.Scheduler,
+		// A task names the AI service provider it probes; the registry
+		// validates that reference and supplies the provider summary
+		// nested in every task response.
+		Providers: opts.ProviderStore,
 		Logger:    opts.Logger,
 		// Echoed back to clients so the UI can explain that a task
 		// still skips verification because of the instance-wide switch.
@@ -240,6 +275,31 @@ func (s *Server) buildAdminRoutes(opts Options) http.Handler {
 	// back to no authentication in that case, preserving the pre-§18
 	// behaviour for builds that run without a JWT middleware.
 	NewAdminTaskHandlers(cfg).Mount(mux)
+
+	// AI request manager: a flat list of predefined AI requests, each
+	// bound to one AI service provider, plus their one-shot execution.
+	NewAdminRequestHandlers(&AdminRequestHandlersConfig{
+		Auth:      opts.Auth,
+		Store:     opts.RequestStore,
+		Service:   opts.RequestService,
+		Providers: opts.ProviderStore,
+		Logger:    opts.Logger,
+	}).Mount(mux)
+
+	// AI service provider registry. The write routes verify that the
+	// upstream is reachable before persisting a provider, so they need
+	// the checker; without it they answer 503 rather than saving an
+	// unverified provider.
+	NewAdminProviderHandlers(&AdminProviderHandlersConfig{
+		Auth:               opts.Auth,
+		Store:              opts.ProviderStore,
+		Checker:            opts.ProviderChecker,
+		CheckTimeout:       opts.ProviderCheckTimeout,
+		Requests:           opts.RequestStore,
+		Tasks:              opts.Store,
+		InsecureSkipVerify: opts.InsecureSkipVerify,
+		Logger:             opts.Logger,
+	}).Mount(mux)
 
 	if opts.Auth != nil && opts.UserStore != nil {
 		userCfg := &AdminUserHandlersConfig{

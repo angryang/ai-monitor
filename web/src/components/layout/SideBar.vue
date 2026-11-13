@@ -15,6 +15,8 @@ interface NavItem {
 }
 
 const items: NavItem[] = [
+  { to: '/providers', labelKey: 'nav.providers', glyph: '◈' },
+  { to: '/requests', labelKey: 'nav.requests', glyph: '⇉' },
   { to: '/tasks', labelKey: 'nav.tasks', glyph: '◧' },
   { to: '/metrics', labelKey: 'nav.metrics', glyph: '∿' },
   { to: '/users', labelKey: 'nav.users', glyph: '◌', adminOnly: true },
@@ -43,7 +45,7 @@ const visible = computed(() => items.filter((i) => !i.adminOnly || isAdmin.value
       </RouterLink>
     </nav>
     <footer class="side__footer">
-      <span class="text-muted">v0.1 · §18 {{ t('nav.controlPlane') }}</span>
+      <span class="text-muted">v0.1 · {{ t('nav.controlPlane') }}</span>
     </footer>
   </aside>
 </template>

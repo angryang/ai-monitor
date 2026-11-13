@@ -10,12 +10,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/glebarez/sqlite"
 	"gorm.io/gorm"
-	"gorm.io/gorm/logger"
 )
 
 // SqliteStore is the default ConfigStore implementation. It owns a single
@@ -42,23 +41,36 @@ type SqliteOptions struct {
 // NewSqliteStore opens (or creates) the SQLite database, enables WAL +
 // busy_timeout pragmas, and runs AutoMigrate. The returned store is safe for
 // concurrent use.
+//
+// Prefer NewSqliteStoreFromDB when the process opens the database itself:
+// the legacy monitoring-task migration has to rewrite the `tasks` table
+// *before* AutoMigrate runs, and that is only possible when the caller owns
+// the GORM handle.
 func NewSqliteStore(opts SqliteOptions) (*SqliteStore, error) {
 	if opts.Path == "" {
 		return nil, fmt.Errorf("config: sqlite path required")
 	}
+	db, err := OpenDB(opts.Path, opts.BusyTimeout)
+	if err != nil {
+		return nil, err
+	}
+	return NewSqliteStoreFromDB(db, opts)
+}
+
+// NewSqliteStoreFromDB builds a store on top of an already-open GORM
+// handle and runs the task-table migration.
+//
+// Sharing the handle with the provider / request / run stores keeps one
+// SQLite file, one WAL and one busy-timeout for the whole process.
+func NewSqliteStoreFromDB(db *gorm.DB, opts SqliteOptions) (*SqliteStore, error) {
+	if db == nil {
+		return nil, fmt.Errorf("config: nil db handle")
+	}
 	if opts.BusyTimeout == 0 {
-		opts.BusyTimeout = 5 * time.Second
+		opts.BusyTimeout = DefaultBusyTimeout
 	}
 	if opts.PollInterval == 0 {
 		opts.PollInterval = 5 * time.Second
-	}
-
-	dsn := fmt.Sprintf("file:%s?_pragma=journal_mode(WAL)&_pragma=busy_timeout(%d)", opts.Path, int(opts.BusyTimeout/time.Millisecond))
-	db, err := gorm.Open(sqlite.Open(dsn), &gorm.Config{
-		Logger: logger.Default.LogMode(logger.Warn),
-	})
-	if err != nil {
-		return nil, fmt.Errorf("config: sqlite open: %w", err)
 	}
 	if err := db.AutoMigrate(&TaskConfig{}); err != nil {
 		return nil, fmt.Errorf("config: migrate: %w", err)
@@ -248,9 +260,35 @@ func (s *SqliteStore) DeleteTask(ctx context.Context, id string) error {
 	return nil
 }
 
-// preWrite moves runtime strings into their encrypted byte columns and
-// JSON-encodes the text protocol blocks. It returns ErrInvalidConfig when
-// the data itself is malformed (validation done elsewhere).
+// ListTasksByProvider returns the tasks that point at one provider.
+//
+// The provider delete route uses it to refuse removing a provider that is
+// still in use: without the guard, a task would keep a dangling provider
+// id and every probe would fail with "provider not found".
+func (s *SqliteStore) ListTasksByProvider(ctx context.Context, providerID string) ([]TaskConfig, error) {
+	var rows []TaskConfig
+	if err := s.db.WithContext(ctx).Where("provider_id = ?", providerID).Order("created_at ASC").Find(&rows).Error; err != nil {
+		return nil, fmt.Errorf("config: list tasks by provider: %w", err)
+	}
+	for i := range rows {
+		if err := decodeJSONColumns(&rows[i]); err != nil {
+			return nil, err
+		}
+		if err := s.decodeSecrets(&rows[i]); err != nil {
+			rows[i].APIKey = ""
+			rows[i].Notify.WeComWebhook = ""
+			rows[i].SecretError = err.Error()
+		}
+	}
+	return rows, nil
+}
+
+// preWrite moves the runtime webhook string into its encrypted byte column
+// and JSON-encodes the text protocol blocks. It returns ErrInvalidConfig
+// when the data itself is malformed (validation done elsewhere).
+//
+// The upstream credentials are not touched here any more: they belong to
+// the provider, and the provider store seals them with the same master key.
 func (s *SqliteStore) preWrite(t *TaskConfig) error {
 	if t == nil {
 		return fmt.Errorf("config: nil task: %w", ErrInvalidConfig)
@@ -261,8 +299,11 @@ func (s *SqliteStore) preWrite(t *TaskConfig) error {
 	if t.Name == "" {
 		return fmt.Errorf("config: missing name: %w", ErrInvalidConfig)
 	}
-	if !t.Protocol.IsValid() {
-		return fmt.Errorf("config: protocol %q: %w", t.Protocol, ErrInvalidConfig)
+	if t.ProviderID == "" {
+		return fmt.Errorf("config: missing provider_id: %w", ErrInvalidConfig)
+	}
+	if strings.TrimSpace(t.Model) == "" {
+		return fmt.Errorf("config: missing model: %w", ErrInvalidConfig)
 	}
 	if t.CanaryGroup == "" {
 		t.CanaryGroup = CanaryGroupLabel
@@ -270,6 +311,9 @@ func (s *SqliteStore) preWrite(t *TaskConfig) error {
 	if err := t.Normalise(); err != nil {
 		return err
 	}
+	// The protocol blocks are runtime-only now (the provider owns them),
+	// but a caller may still hand one in — validate its JSON so a broken
+	// header map is caught at write time rather than at probe time.
 	if t.OpenAI != nil {
 		if _, err := jsonToString(t.OpenAI.ExtraHeadersJSON); err != nil {
 			return err
@@ -285,27 +329,17 @@ func (s *SqliteStore) preWrite(t *TaskConfig) error {
 			return err
 		}
 	}
-	// Encrypt API key (if cipher attached) — silently keep ciphertext as-is
-	// when the input is empty and ciphertext exists.
+	// Encrypt the notification webhook (if cipher attached) — silently keep
+	// ciphertext as-is when the input is empty and ciphertext exists.
 	c := s.cipherOrNil()
-	if c != nil {
-		if t.APIKey != "" {
-			enc, err := c.Encrypt([]byte(t.APIKey))
-			if err != nil {
-				return fmt.Errorf("config: encrypt api_key: %w", err)
-			}
-			t.APIKeyEnc = enc
+	if c != nil && t.Notify.WeComWebhook != "" {
+		enc, err := c.Encrypt([]byte(t.Notify.WeComWebhook))
+		if err != nil {
+			return fmt.Errorf("config: encrypt wecom webhook: %w", err)
 		}
-		if t.Notify.WeComWebhook != "" {
-			enc, err := c.Encrypt([]byte(t.Notify.WeComWebhook))
-			if err != nil {
-				return fmt.Errorf("config: encrypt wecom webhook: %w", err)
-			}
-			t.Notify.WeComWebhookEnc = enc
-		}
+		t.Notify.WeComWebhookEnc = enc
 	}
 	// Always zero plaintext secrets after the write.
-	t.APIKey = ""
 	t.Notify.WeComWebhook = ""
 	return nil
 }
@@ -313,17 +347,13 @@ func (s *SqliteStore) preWrite(t *TaskConfig) error {
 // decodeSecrets reverses preWrite's encryption step. Decryption failures
 // surface as errors so callers (probe runner) can decide policy. Missing
 // ciphertext results in empty strings.
+//
+// Only the notification webhook is sealed on the task itself: the upstream
+// api key belongs to the provider and is resolved at bind time.
 func (s *SqliteStore) decodeSecrets(t *TaskConfig) error {
 	c := s.cipherOrNil()
 	if c == nil {
 		return nil
-	}
-	if len(t.APIKeyEnc) > 0 && t.APIKey == "" {
-		raw, err := c.Decrypt(t.APIKeyEnc)
-		if err != nil {
-			return fmt.Errorf("config: decrypt api_key: %w", err)
-		}
-		t.APIKey = string(raw)
 	}
 	if len(t.Notify.WeComWebhookEnc) > 0 && t.Notify.WeComWebhook == "" {
 		raw, err := c.Decrypt(t.Notify.WeComWebhookEnc)
@@ -401,39 +431,38 @@ func (s *SqliteStore) Watch(ctx context.Context) (<-chan Event, error) {
 // fingerprintAll returns a map of task id -> fingerprint. The fingerprint is
 // the SHA-256 of the row + secret column. Using hash avoids recomputing the
 // full ciphertext on every tick.
+//
+// The upstream coordinates are not part of the fingerprint: they live on the
+// provider and are resolved at bind time, so editing a provider takes
+// effect on the next probe without a scheduler reload. The selected model
+// IS part of it — it lives on the task row and changing it changes what the
+// probe sends.
 func (s *SqliteStore) fingerprintAll(ctx context.Context) (map[string]string, error) {
 	type fpRow struct {
-		ID                 string
-		Name               string
-		Enabled            bool
-		Protocol           string
-		BaseURL            string
-		APIKeyEnc          []byte
-		Model              string
-		PromptVars         string
-		Schedule           string
-		TimeoutMS          int64
-		CanaryGroup        string
-		InsecureSkipVerify bool
-		NotifyEnabled      bool
-		WebhookEnc         []byte
-		OpenAIEnc          string
-		AnthropicEnc       string
-		GeminiEnc          string
+		ID          string
+		Name        string
+		Enabled     bool
+		ProviderID  string
+		Model       string
+		PromptVars  string
+		Schedule    string
+		CanaryGroup string
+		NotifyEnabled bool
+		Channel     string
+		WebhookEnc  []byte
 	}
 	var rows []fpRow
 	if err := s.db.WithContext(ctx).
 		Table(TaskConfigTableName).
-		Select("id, name, enabled, protocol, base_url, api_key_enc, model, prompt_vars, schedule, timeout_ms, canary_group, insecure_skip_verify, enabled as notify_enabled, wecom_webhook_enc as webhook_enc, openai_extra_headers as openai_enc, anthropic_extra_headers as anthropic_enc, gemini_extra_headers as gemini_enc").
+		Select("id, name, enabled, provider_id, model, prompt_vars, schedule, canary_group, notify_enabled, notify_channel, notify_wecom_webhook_enc as webhook_enc").
 		Scan(&rows).Error; err != nil {
 		return nil, fmt.Errorf("config: fingerprint scan: %w", err)
 	}
 	out := make(map[string]string, len(rows))
 	for _, r := range rows {
-		h := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%t|%s|%s|%x|%s|%s|%s|%d|%s|%t|%t|%x|%s|%s|%s",
-			r.ID, r.Name, r.Enabled, r.Protocol, r.BaseURL, r.APIKeyEnc, r.Model,
-			r.PromptVars, r.Schedule, r.TimeoutMS, r.CanaryGroup, r.InsecureSkipVerify,
-			r.NotifyEnabled, r.WebhookEnc, r.OpenAIEnc, r.AnthropicEnc, r.GeminiEnc)))
+		h := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%t|%s|%s|%s|%s|%s|%t|%s|%x",
+			r.ID, r.Name, r.Enabled, r.ProviderID, r.Model, r.PromptVars, r.Schedule,
+			r.CanaryGroup, r.NotifyEnabled, r.Channel, r.WebhookEnc)))
 		out[r.ID] = hex.EncodeToString(h[:])
 	}
 	return out, nil
@@ -442,6 +471,11 @@ func (s *SqliteStore) fingerprintAll(ctx context.Context) (map[string]string, er
 // decodeJSONColumns fills in the PromptVars map and the *Protocol structs
 // from the JSON-serialised text columns. Empty/blank columns are left nil
 // so callers don't have to distinguish "absent" from "empty".
+//
+// The protocol blocks are runtime-only since the provider registry took
+// over the upstream coordinates, so a row read from SQLite never carries
+// them — the collapse below keeps the function correct for callers that
+// hand in a struct that was filled in memory.
 func decodeJSONColumns(t *TaskConfig) error {
 	if err := t.Hydrate(); err != nil {
 		return err
@@ -459,12 +493,6 @@ func decodeJSONColumns(t *TaskConfig) error {
 	}
 	if t.Gemini != nil && t.Gemini.ExtraHeadersJSON == "" && (t.Gemini.Alt == "" || t.Gemini.Alt == "sse") {
 		t.Gemini = nil
-	}
-	if len(t.APIKeyEnc) > 0 {
-		// Decryption happens in B3 once the cipher is wired up. We do NOT
-		// touch APIKeyEnc here — leaving the raw ciphertext in memory at
-		// this layer is acceptable because the cipher decrypts lazily in
-		// the runner.
 	}
 	return nil
 }

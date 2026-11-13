@@ -27,10 +27,10 @@ func (f *fakeStore) ListTasks(_ context.Context) ([]config.TaskConfig, error) {
 	return f.tasks, f.err
 }
 func (f *fakeStore) GetTask(_ context.Context, _ string) (*config.TaskConfig, error) { return nil, nil }
-func (f *fakeStore) CreateTask(_ context.Context, _ *config.TaskConfig) error         { return nil }
-func (f *fakeStore) UpdateTask(_ context.Context, _ *config.TaskConfig) error         { return nil }
+func (f *fakeStore) CreateTask(_ context.Context, _ *config.TaskConfig) error        { return nil }
+func (f *fakeStore) UpdateTask(_ context.Context, _ *config.TaskConfig) error        { return nil }
 func (f *fakeStore) DeleteTask(_ context.Context, _ string) error                    { return nil }
-func (f *fakeStore) Watch(_ context.Context) (<-chan config.Event, error)             { return nil, nil }
+func (f *fakeStore) Watch(_ context.Context) (<-chan config.Event, error)            { return nil, nil }
 func (f *fakeStore) Close() error                                                    { return nil }
 
 func TestHealthz_Ok(t *testing.T) {
@@ -87,25 +87,25 @@ func TestAdminListTasks_RedactsSecrets(t *testing.T) {
 		t.Fatalf("store: %v", err)
 	}
 	defer store.Close()
+	// The upstream credential lives on the provider now; the notification
+	// webhook still lives on the task. Neither may reach the browser.
+	providers := newMemProviderStore(alphaProvider())
 	tc := &config.TaskConfig{
-		ID:      "t-1",
-		Name:    "demo",
-		Enabled: true,
-		Protocol: config.ProtocolOpenAI,
-		BaseURL: "http://example",
-		APIKey:  "sk-secret",
-		Model:   "gpt-4o",
+		ID:         "t-1",
+		Name:       "demo",
+		Enabled:    true,
+		ProviderID: "prv-alpha",
+		Model:      "gpt-test",
 		UserPrompt: "hi",
 		Notify: config.NotifyConfig{
 			Enabled:      true,
 			WeComWebhook: "https://webhook",
 		},
-		OpenAI: &config.OpenAIConfig{StreamPath: "/v1"},
 	}
 	if err := store.CreateTask(context.Background(), tc); err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	srv := New(Options{Addr: ":9090", Store: store})
+	srv := New(Options{Addr: ":9090", Store: store, ProviderStore: providers})
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/admin/tasks", nil)
 	srv.Handle().ServeHTTP(rec, req)

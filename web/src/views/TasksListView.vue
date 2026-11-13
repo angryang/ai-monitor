@@ -18,18 +18,21 @@ const { isAdmin } = useRole()
 onMounted(() => tasks.fetchAll())
 
 const columns = computed(() => [
-  { key: 'name', label: t('task.col.name'), width: '24%' },
-  { key: 'protocol', label: t('task.col.protocol'), width: '12%' },
-  { key: 'model', label: t('task.col.model'), width: '20%' },
+  { key: 'name', label: t('task.col.name'), width: '26%' },
+  { key: 'provider', label: t('task.col.provider'), width: '26%' },
   { key: 'schedule', label: t('task.col.schedule'), width: '16%' },
   { key: 'status', label: t('task.col.status'), width: '14%' },
-  { key: 'updated', label: t('task.col.updated'), width: '14%' },
+  { key: 'updated', label: t('task.col.updated'), width: '18%' },
 ])
 
 // Tasks whose stored secrets could not be decrypted with the current master
-// key. They are listed but carry no usable credentials until the api key is
-// re-entered, so they are not scheduled either.
+// key. They are listed but carry no usable notification channel until the
+// webhook is re-entered.
 const brokenTasks = computed(() => tasks.tasks.filter((task) => !!task.secret_error))
+
+// Tasks whose provider no longer exists. The provider id is a dangling
+// reference, so the probe would fail on every tick.
+const orphanTasks = computed(() => tasks.tasks.filter((task) => !task.provider))
 
 function goDetail(row: Task) { router.push(`/tasks/${row.id}`) }
 function goEdit(row: Task) { router.push(`/tasks/${row.id}/edit`) }
@@ -62,6 +65,10 @@ function goCreate() { router.push('/tasks/new') }
         <strong>{{ t('task.list.secretErrorTitle') }}</strong>
         <span>{{ t('task.list.secretErrorDesc', { names: brokenTasks.map((task) => task.name).join('、') }) }}</span>
       </div>
+      <div v-if="orphanTasks.length > 0" class="tasks__alert" role="alert">
+        <strong>{{ t('task.list.orphanTitle') }}</strong>
+        <span>{{ t('task.list.orphanDesc', { names: orphanTasks.map((task) => task.name).join('、') }) }}</span>
+      </div>
       <EmptyState
         v-if="tasks.tasks.length === 0"
         :title="t('task.list.emptyTitle')"
@@ -76,11 +83,12 @@ function goCreate() { router.push('/tasks/new') }
         <template #cell-name="{ row }">
           <button class="tasks__name" type="button" @click="goDetail(row)">{{ row.name }}</button>
         </template>
-        <template #cell-protocol="{ row }">
-          <Badge tone="accent">{{ row.protocol }}</Badge>
-        </template>
-        <template #cell-model="{ row }">
-          <span class="text-mono">{{ row.model }}</span>
+        <template #cell-provider="{ row }">
+          <span v-if="row.provider" class="tasks__provider">
+            <Badge tone="accent">{{ row.provider.protocol }}</Badge>
+            <span>{{ row.provider.name }}</span>
+          </span>
+          <span v-else class="tasks__secret-error">{{ t('task.list.orphanBadge') }}</span>
         </template>
         <template #cell-schedule="{ row }">
           <span class="text-mono text-muted">{{ row.schedule }}</span>
@@ -95,13 +103,20 @@ function goCreate() { router.push('/tasks/new') }
           <div class="tasks__detail">
             <dl>
               <dt>{{ t('task.detail.id') }}</dt><dd class="text-mono">{{ row.id }}</dd>
-              <dt>{{ t('task.detail.baseUrl') }}</dt><dd class="text-mono">{{ row.base_url }}</dd>
+              <dt>{{ t('task.col.provider') }}</dt>
+              <dd>
+                <template v-if="row.provider">
+                  <span class="text-mono">{{ row.provider.name }}</span>
+                  <span class="text-mono text-muted"> · {{ row.model }} · {{ row.provider.base_url }}</span>
+                </template>
+                <span v-else class="tasks__secret-error">{{ t('task.list.orphanBadge') }}</span>
+              </dd>
               <dt>{{ t('task.detail.userPrompt') }}</dt><dd class="text-mono">{{ row.user_prompt }}</dd>
               <dt>{{ t('task.detail.canaryGroup') }}</dt><dd class="text-mono">{{ row.canary_group }}</dd>
               <dt>{{ t('task.detail.apiKey') }}</dt>
               <dd>
-                <span v-if="row.secret_error" class="tasks__secret-error">{{ t('task.list.secretErrorBadge') }}</span>
-                <span v-else>{{ row.has_api_key ? t('task.detail.configured') : t('task.detail.notSet') }}</span>
+                <span v-if="row.provider?.secret_error" class="tasks__secret-error">{{ t('task.list.secretErrorBadge') }}</span>
+                <span v-else>{{ row.provider?.has_api_key ? t('task.detail.configured') : t('task.detail.notSet') }}</span>
               </dd>
               <dt>{{ t('task.detail.webhook') }}</dt><dd>{{ row.notify.has_webhook ? t('task.detail.configured') : t('task.detail.notSet') }}</dd>
             </dl>
@@ -139,6 +154,7 @@ function goCreate() { router.push('/tasks/new') }
 }
 .tasks__alert strong { color: var(--danger); font-weight: var(--fw-semibold); }
 .tasks__secret-error { color: var(--danger); font-weight: var(--fw-semibold); }
+.tasks__provider { display: inline-flex; align-items: center; gap: var(--space-2); }
 .tasks__name {
   background: transparent;
   border: 0;

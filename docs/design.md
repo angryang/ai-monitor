@@ -371,6 +371,10 @@ func List() []string
 
 ### 11.3 `internal/config/task.go`
 
+> §18.17 增量后：上游坐标全部移出任务，`TaskConfig` 只保留自身字段 +
+> `provider_id`；协议 / 地址 / 密钥 / 模型 / 超时 / TLS / thinking /
+> 协议块变成运行期字段（`gorm:"-"`），由 `provider.Binder` 在探测前填入。
+
 ```go
 type Protocol string
 const (
@@ -386,30 +390,39 @@ type TaskConfig struct {
     ID           string            `gorm:"primaryKey;size:64"`
     Name         string            `gorm:"uniqueIndex;size:128;not null" validate:"required,min=1,max=128"`
     Enabled      bool              `gorm:"not null;default:true"`
-    Protocol     Protocol          `gorm:"size:32;not null" validate:"required,oneof=openai anthropic gemini"`
-    BaseURL      string            `gorm:"size:512;not null" validate:"required,url"`
-    InsecureSkipVerify bool        `gorm:"column:insecure_skip_verify;not null;default:false" yaml:"insecure_skip_verify,omitempty"` // 跳过上游 TLS 证书校验
-    APIKey       string            `gorm:"-"`            // 运行时
-    APIKeyEnc    []byte            `gorm:"column:api_key_enc;type:blob"`
-    Model        string            `gorm:"size:128;not null" validate:"required"`
+    ProviderID   string            `gorm:"column:provider_id;size:64;index;not null"` // -> ai_providers.id
+    // --- 以下全部是运行期字段（gorm:"-"），探测前由 provider.Binder 填入 ---
+    Protocol          Protocol          `gorm:"-"`
+    BaseURL           string            `gorm:"-"`
+    APIKey            string            `gorm:"-"`
+    APIKeyEnc         []byte            `gorm:"-"`
+    Model             string            `gorm:"-"`
+    InsecureSkipVerify bool             `gorm:"-"`
+    ThinkingEnabled   bool              `gorm:"-"`
+    Timeout           time.Duration     `gorm:"-"`
+    TimeoutMS         int64             `gorm:"-"`
+    OpenAI            *OpenAIConfig     `gorm:"-"`
+    Anthropic         *AnthropicConfig  `gorm:"-"`
+    Gemini            *GeminiConfig     `gorm:"-"`
+    // --- 任务自身字段 ---
     SystemPrompt string            `gorm:"type:text"`
     UserPrompt   string            `gorm:"type:text" validate:"required"`
-    PromptVars   map[string]string `gorm:"type:text"`     // JSON
+    PromptVars   map[string]string `gorm:"-"`           // JSON
+    PromptVarsJSON string          `gorm:"column:prompt_vars;type:text"`
     Schedule     string            `gorm:"size:128;not null" validate:"required"` // cron 6 位
-    Timeout      time.Duration     `gorm:"not null;default:30s" validate:"min=1s,max=10m"`
+    CanaryGroup  string            `gorm:"size:64;not null;default:default"`
     Notify       NotifyConfig      `gorm:"embedded"`
-    OpenAI       *OpenAIConfig     `gorm:"embedded" yaml:"openai,omitempty"`
-    Anthropic    *AnthropicConfig  `gorm:"embedded" yaml:"anthropic,omitempty"`
-    Gemini       *GeminiConfig     `gorm:"embedded" yaml:"gemini,omitempty"`
     CreatedAt    time.Time         `gorm:"autoCreateTime"`
     UpdatedAt    time.Time         `gorm:"autoUpdateTime"`
 }
 
+// 通知开关用独立列名：否则 embedded 的 Enabled 会和 TaskConfig.Enabled
+// 抢同一个 `enabled` 列，通知开关实际从未落库。
 type NotifyConfig struct {
-    Enabled         bool          `gorm:"not null;default:false"`
-    Channel         NotifyChannel `gorm:"size:32;not null;default:wecom" validate:"omitempty,oneof=wecom"`
+    Enabled         bool          `gorm:"column:notify_enabled;not null;default:false"`
+    Channel         NotifyChannel `gorm:"column:notify_channel;size:32;not null;default:wecom" validate:"omitempty,oneof=wecom"`
     WeComWebhook    string        `gorm:"-"`
-    WeComWebhookEnc []byte        `gorm:"column:wecom_webhook_enc;type:blob"`
+    WeComWebhookEnc []byte        `gorm:"column:notify_wecom_webhook_enc;type:blob"`
 }
 
 type OpenAIConfig struct {
@@ -790,34 +803,38 @@ db, _ := gorm.Open(sqlite.Open(
 db.AutoMigrate(&TaskConfig{})  // 单表，含 embedded Notify / OpenAI / Anthropic / Gemini
 ```
 
-**生成的 `tasks` 表关键字段**：
+**生成的 `tasks` 表关键字段（§18.17 增量后）** —— 任务只保留自身字段，
+上游坐标全部由 `provider_id` 引用 `ai_providers`：
 
 ```sql
 CREATE TABLE tasks (
     id              VARCHAR(64)  PRIMARY KEY,
     name            VARCHAR(128) NOT NULL UNIQUE,
     enabled         BOOLEAN      NOT NULL DEFAULT 1,
-    protocol        VARCHAR(32)  NOT NULL,
-    base_url        VARCHAR(512) NOT NULL,
-    insecure_skip_verify BOOLEAN  NOT NULL DEFAULT 0,        -- 跳过上游 TLS 证书校验
-    api_key_enc     BLOB,
-    model           VARCHAR(128) NOT NULL,
+    provider_id     VARCHAR(64)  NOT NULL,                   -- -> ai_providers.id
     system_prompt   TEXT,
     user_prompt     TEXT,
     prompt_vars     TEXT,                                    -- JSON
     schedule        VARCHAR(128) NOT NULL,
-    timeout_seconds INTEGER      NOT NULL DEFAULT 30,
+    canary_group    VARCHAR(64)  NOT NULL DEFAULT 'default',
     notify_enabled  BOOLEAN      NOT NULL DEFAULT 0,
     notify_channel  VARCHAR(32)  NOT NULL DEFAULT 'wecom',
-    wecom_webhook_enc BLOB,
-    openai_stream_path      VARCHAR(256),
-    openai_extra_headers    TEXT,                            -- JSON
-    anthropic_max_tokens    INTEGER      DEFAULT 1024,
-    gemini_alt              VARCHAR(32)  DEFAULT 'sse',
+    notify_wecom_webhook_enc BLOB,
     created_at  DATETIME,
     updated_at  DATETIME
 );
+CREATE INDEX idx_tasks_provider_id ON tasks(provider_id);
 ```
+
+> **设计要点**：
+> - **协议 / 地址 / 密钥 / 模型 / 超时 / TLS / thinking 全部移出任务**，
+>   统一由服务商持有；任务在**探测时**绑定服务商（见 §18.17）。
+> - **`notify_enabled` 是独立列**：旧模型里 `Notify.Enabled` 与
+>   `TaskConfig.Enabled` 抢同一个 `enabled` 列，通知开关实际从未落库；
+>   现在拆成 `enabled` 与 `notify_enabled` 两列。
+> - **表是重建出来的**：SQLite 不能给已有表加 `NOT NULL` 列，
+>   `provider_id` 又是必填，因此升级路径是「建新表 → 搬数据 → 改名」
+>   （`provider.MigrateLegacyTasks`）。
 
 **`probe_runs` 表（**§18.11 增量**）** —— 每次探测一行，admin 看历史趋势/失败溯源：
 
@@ -847,6 +864,66 @@ CREATE INDEX idx_probe_runs_started_at ON probe_runs(started_at);
 > - **GORM AutoMigrate**：`main` 启动时跑一次，schema 不一致时才发 `CREATE TABLE / INDEX`，幂等。
 > - **Prune 用窗口函数**：见 §11.13 的 SQL，单条 DELETE 把所有任务的历史裁到 `keep` 条（默认 100）。
 > - **RBAC**：`GET /admin/tasks/{id}/runs` 与其它 GET 同权限（viewer / admin 都可读）。
+
+**`ai_providers` 表（§18.15 增量）** —— AI 服务提供商注册表，一个上游端点定义一次：
+
+```sql
+CREATE TABLE ai_providers (
+    id              VARCHAR(64)  PRIMARY KEY,
+    name            VARCHAR(128) NOT NULL UNIQUE,
+    description     VARCHAR(512),
+    enabled         BOOLEAN      NOT NULL DEFAULT 1,
+    protocol        VARCHAR(32)  NOT NULL,                   -- openai / anthropic / gemini
+    base_url        VARCHAR(512) NOT NULL,
+    api_key_enc     BLOB,                                   -- 与 tasks / request_groups 同一把 master key
+    model           VARCHAR(128) NOT NULL,
+    timeout_ms      INTEGER      NOT NULL DEFAULT 30000,
+    insecure_skip_verify BOOLEAN  NOT NULL DEFAULT 0,
+    thinking_enabled     BOOLEAN NOT NULL DEFAULT 0,
+    stream_path             VARCHAR(256),
+    openai_extra_headers   TEXT,                            -- JSON
+    max_tokens             INTEGER     DEFAULT 1024,
+    anthropic_extra_headers TEXT,                           -- JSON
+    alt                    VARCHAR(32) DEFAULT 'sse',
+    gemini_extra_headers   TEXT,                            -- JSON
+    last_verified_at       DATETIME,                        -- 最近一次连通性校验时间
+    last_verified_ok       BOOLEAN NOT NULL DEFAULT 0,
+    last_verified_message  VARCHAR(512),
+    created_at  DATETIME,
+    updated_at  DATETIME
+);
+```
+
+> **设计要点**：
+> - **共享 `*gorm.DB`**：与 `tasks` / `ai_requests` / `probe_runs` 同一个句柄。
+> - **落库即已校验**：只有上游接受过请求的行才会写进这张表（`force` 豁免除外，且 `last_verified_ok = 0`）。
+> - **解密失败保留密文**：`secret_error` 走接口返回，密文留在库里，避免一次无关写入把密钥抹掉。
+
+**`ai_requests` 表（§18.16 增量）** —— 扁平的 AI 请求；`request_groups` /
+`request_items` 已随 §18.16 的一次性迁移删除：
+
+```sql
+CREATE TABLE ai_requests (
+    id                VARCHAR(64)  PRIMARY KEY,
+    provider_id       VARCHAR(64)  NOT NULL,   -- -> ai_providers.id
+    name              VARCHAR(128) NOT NULL,
+    description       VARCHAR(512),
+    system_prompt     TEXT,
+    user_prompt       TEXT         NOT NULL,
+    prompt_vars       TEXT,                    -- JSON map
+    sort_order        INTEGER      NOT NULL DEFAULT 0,
+    thinking_override INTEGER,                -- NULL = 继承服务商设置
+    created_at        DATETIME,
+    updated_at        DATETIME
+);
+CREATE INDEX idx_ai_requests_provider_id ON ai_requests(provider_id);
+```
+
+> **设计要点**：
+> - **请求不带密钥、不带上游坐标**：全部由 `provider_id` 引用服务商，一处维护。
+> - **`provider_id` 是逻辑外键**：删除服务商前由接口校验引用（409），不依赖 SQLite 外键开关。
+> - **运行溯源在 `probe_runs`**：`provider_id` / `ai_request_id` 两列取代旧的
+>   `group_id` / `item_id`；`request_id` 另有所指（上游 `X-Req-Id`），故加 `ai_` 前缀避免歧义。
 
 ---
 
@@ -1987,6 +2064,519 @@ type RequestError struct {
 
 ---
 
+### 18.15 增量 · AI 服务提供商管理（保存前强制连通性校验）
+
+> **触发场景**：监控任务与 AI 请求组各自持有一份"上游坐标"（协议 / 地址 / 密钥 / 模型）。同一套坐标在两处各写一遍，改一处忘另一处是迟早的事；更麻烦的是，**填错的坐标会安静地存进去**，直到若干分钟后的第一次探测失败才暴露——而那时它已经在告警了。用户诉求：能定义 AI 服务提供商、对其增删改查，**且保存之前必须确认它真的连得上**。
+
+#### 18.15.1 目标
+
+- 新增 **AI 服务提供商注册表**：一个上游端点定义一次，任务与请求组引用它
+- 提供商的增删改查走 `/admin/providers`，语义与 `/admin/request-groups` 对齐
+- **保存前强制连通性校验**：上游没接受请求，就不落库
+- 校验结论要能指导排查：401 / 404 / 5xx / 超时 / 连不上，各归各类
+- 密钥加密落库，接口只回 `has_api_key`，明文永不回显
+
+#### 18.15.2 关键设计决策
+
+| 决策 | 选项 | 选择 | 理由 |
+|---|---|---|---|
+| 校验怎么发请求 | 另写一套最小请求 / 复用 protocol adapter | **复用 protocol adapter** | "这个服务商连得上吗"必须与"指向它的监控任务能不能跑"同答案；只有下发同一个请求才能保证一致。另写一套意味着 URL / 鉴权头 / 协议细节要维护两份 |
+| 校验读到什么程度 | 读完整个响应 / 读到响应头 | **读到响应头** | 响应头到达即证明：域名可解析、TLS 可接受、密钥被接受、模型存在。读完整个响应既慢又白花钱 |
+| 校验算不算一次探测 | 计入监控信号 / 独立通道 | **独立通道** | 它是一次配置校验，不是监控采样。计入就会污染成功率窗口与告警——上游本来就有问题，再自己报一次警没有意义 |
+| 失败时能不能存 | 一律拒绝 / 一律允许 / 显式豁免 | **默认拒绝，`force` 显式豁免** | 连不上的服务商比没有更糟（会被反复探测并告警）；但上游计划内维护时运维确实需要能先登记下来，留一个显式出口 |
+| 校验超时放哪 | 硬编码 / 配置项 | **配置项 `provider_check_timeout`** | 同时也是 admin 写接口的挂起上限，必须能被运维按上游快慢调整 |
+| HTTP 写超时 | 不动 / 跟着校验超时一起抬 | **跟着抬** | 校验是同步的：写超时不动的话，一次 15s 的校验会被服务端在 5s 掐断，前端只看到连接重置，看不到真正的失败原因 |
+| 校验结论怎么回 | 只回错误码 / 附带结构化结论 | **错误 `details` 里带完整结论** | "401" 与 "Incorrect API key provided: sk-***" 对运维的价值差一个量级；前者要再查一轮，后者直接可行动 |
+| 密钥解不开怎么办 | 列表里隐藏 / 列表里标出来 | **标出来（`secret_error`）** | 主密钥换过是常见运维事故；此时唯一需要的就是把这一行显式标出来让人修，隐藏只会让人以为服务商不见了 |
+
+#### 18.15.3 数据模型
+
+新表 `ai_providers`（`internal/provider/model.go`，`AutoMigrate` 自动建表）：
+
+| 列 | 类型 | 说明 |
+|---|---|---|
+| `id` | TEXT PK | uuid v4 |
+| `name` | TEXT UNIQUE NOT NULL | 唯一名称 |
+| `description` | TEXT | 备注 |
+| `enabled` | BOOL | 停用后保留配置但不外发 |
+| `protocol` | TEXT NOT NULL | `openai` / `anthropic` / `gemini` |
+| `base_url` | TEXT NOT NULL | 上游地址 |
+| `api_key_enc` | BLOB | AES-GCM 密封后的密钥 |
+| `model` | TEXT NOT NULL | 模型名 |
+| `timeout_ms` | INT | 单请求超时（同时是校验超时上限） |
+| `insecure_skip_verify` | BOOL | 单服务商跳过 TLS 校验 |
+| `thinking_enabled` | BOOL | 默认思考开关 |
+| `stream_path` / `openai_extra_headers` / `max_tokens` / `anthropic_extra_headers` / `alt` / `gemini_extra_headers` | — | 协议块，字段与 `config.TaskConfig` 一致 |
+| `last_verified_at` / `last_verified_ok` / `last_verified_message` | — | 最近一次校验的结论 |
+
+密钥与任务 / 请求组共用同一把 master key（`config.Cipher`），三张表用同一套密封格式。
+
+**解密失败不清空密文**：主密钥换过时，`hydrate` 记录 `secret_error` 但保留 `api_key_enc`——否则一次无关的改名就会把还能救回来的密钥抹掉。
+
+#### 18.15.4 连通性校验
+
+`internal/provider/connectivity.go`：
+
+```
+Check(ctx, provider) → CheckResult{ok, kind, status_code, message, latency_ms, url, checked_at}
+```
+
+流程：
+
+1. 校验配置完整性（协议 / 地址 / 模型 / 密钥）→ 不完整则 `config_error`，**不发请求**
+2. 取适配器 → `adapter.Validate(&TaskConfig)` → 不合法则 `config_error`
+3. 用**该服务商自己的**配置组装 `config.TaskConfig`（只带自己那个协议块），下发真实请求
+4. 读到响应头即成功；`stream.Close()` 立刻掐断生成
+5. 错误分类：
+
+| 判定 | `kind` |
+|---|---|
+| `context.DeadlineExceeded` | `timeout` |
+| `protocol.ErrUnauthorized`（401 / 403） | `unauthorized` |
+| `protocol.ErrProtocolCfg`（其余 4xx） | `invalid_request` |
+| `protocol.ErrUpstreamDown` 且 `status_code >= 500` | `upstream_unavailable` |
+| `protocol.ErrUpstreamDown` 且 `status_code == 0` | `network_error` |
+
+`status_code` 由 `protocol.RequestError` 新增的 `StatusCode` 字段提供——不靠解析错误消息里的 `"status %d"`，那种写法一改文案就失效。
+
+错误消息优先取**上游自己的错误响应体**（`Incorrect API key provided`），并附上本次 `X-Req-Id`，方便在上游日志里定位到这一次尝试。
+
+#### 18.15.5 接口契约
+
+| 端点 | 语义 |
+|---|---|
+| `GET /admin/providers` | 列出全部 |
+| `GET /admin/providers/{id}` | 读一条 |
+| `POST /admin/providers` | 新建（**先校验后落库**） |
+| `PATCH /admin/providers/{id}` | 更新（**先校验后落库**） |
+| `DELETE /admin/providers/{id}` | 删除 |
+| `POST /admin/providers/check` | 只校验不落库（表单的「测试连通性」） |
+| `POST /admin/providers/{id}/check` | 用已存密钥复验（不必重新输入密钥） |
+
+校验失败时写接口返回 `422`，错误信封形如：
+
+```json
+{
+  "error": {
+    "code": "provider_unreachable",
+    "message": "{\"error\":{\"message\":\"Incorrect API key provided\"}} (x-req-id: …)",
+    "details": { "ok": false, "kind": "unauthorized", "status_code": 401, "url": "…", "latency_ms": 12 }
+  }
+}
+```
+
+`details` 是 `APIError` 新增的可选字段，普通错误不填，形状保持不变。
+
+`PATCH` 的语义与请求组一致：未提及的字段保留旧值，**合并后的完整结果**才拿去校验并落库；`api_key` 为空表示保留旧密钥。
+
+#### 18.15.6 RBAC
+
+| 动作 | viewer | admin |
+|---|---|---|
+| `GET /admin/providers[/{id}]` | ✅ | ✅ |
+| `POST /admin/providers/check` | ❌ | ✅ |
+| `POST /admin/providers/{id}/check` | ❌ | ✅ |
+| `POST /admin/providers` | ❌ | ✅ |
+| `PATCH /admin/providers/{id}` | ❌ | ✅ |
+| `DELETE /admin/providers/{id}` | ❌ | ✅ |
+
+校验会真实打到上游，因此属于"会触发外部调用"的写操作，viewer 一律不放行。
+
+#### 18.15.7 前端
+
+- `web/src/api/providers.ts`：`Provider` / `ProviderCheck` / `ProviderWritePayload`
+- `web/src/stores/providers.ts`：列表、保存、校验状态
+- `web/src/components/providers/ProviderFormModal.vue`：新建 / 编辑表单 + 「测试连通性」+ 校验结论面板；校验失败时额外出现「仍然保存」（`force`）
+- `web/src/views/ProvidersView.vue`：列表、校验状态徽章、逐条复验
+- 路由 `/providers`，侧栏「AI 服务商」，中英双语文案
+- `ApiError` 新增 `details`，让前端的 toast 与表单面板能拿到校验结论
+
+#### 18.15.8 验收
+
+- [x] 上游不可达 → `422`，且**没有落库**
+- [x] 密钥错误 → `422`，`kind = unauthorized`，带上游错误体与 `X-Req-Id`
+- [x] 上游可达 → `201`，行上标记 `last_verified_ok`
+- [x] `PATCH` 不带 `api_key` → 旧密钥保留；不带其它字段 → 旧值保留
+- [x] `PATCH` 成不可达地址 → `422`，旧地址仍在
+- [x] `force: true` → 落库，且标记为未通过校验
+- [x] 重名 → `409`
+- [x] 响应任何位置都不含明文密钥
+- [x] 主密钥换过 → 列表照常显示，行上带 `secret_error`，密文未被抹掉
+- [x] `go test -race` 干净；`scripts/e2e_providers.py` 全绿；前端 `vue-tsc -b` + `vite build` 干净
+
+#### 18.15.9 不在范围内（留 P2）
+
+- 让监控任务**引用**服务商（AI 请求管理已在 §18.16 改为引用，监控任务仍自带坐标）
+- 服务商的批量导入 / 导出
+- 按服务商维度看历史成功率（目前只有单次校验结论）
+- 校验结果的定时巡检（"现在还能连上吗"应与"保存时能连上"分开）
+- 服务商侧的限流 / 熔断
+
+---
+
+### 18.16 增量 · AI 请求管理去掉请求组（每条请求对接一个服务商）
+
+#### 18.16.1 目标
+
+原模型把「上游坐标 + 一组预定义请求」捆成 **request group**，请求挂在组下面。
+它有两个问题：同一套 URL / 密钥在服务商注册表（§18.15）里已经存了一份，
+组里再存一遍必然漂移；且「一个组 = 一个上游」意味着想让不同请求打到不同
+上游，只能建很多只有一个请求的组。
+
+本次改造**彻底删掉请求组这一层**，改成扁平模型：
+
+- 一个 `ai_requests` 行 = 一条 AI 请求（prompt + `${var}` + `provider_id`）；
+- `provider_id` 指向 §18.15 的服务商，**不同请求可以指向不同服务商**；
+- 一个批次可以同时打到多个上游，每条请求用自己服务商的坐标；
+- 服务商改一次，引用它的所有请求同时生效。
+
+#### 18.16.2 关键设计决策
+
+| 决策 | 选择 | 理由 |
+|---|---|---|
+| 存储模型 | 新表 `ai_requests`，不再有 `request_groups` | 概念要真的消失，而不是 UI 上隐藏；旧表迁移完即 DROP |
+| 请求与上游的关系 | **引用** `provider_id`，不复制坐标 | 一处维护；也才能满足「每条请求对接不同服务商」 |
+| 删除仍被引用的服务商 | **409 拒绝**，附受影响的请求名 | 静默删掉会让请求变成孤儿，且不报错 |
+| 批次结果字段 | `provider_id` / `provider_name` 取代 `group_id` / `group_name` | 一个批次本来就跨服务商，必须逐条标注 |
+| 运行溯源 | `probe_runs` 新增 `provider_id` / `ai_request_id` | 和上游的 `X-Req-Id`（`request_id`）区分开，旧名已被占用 |
+| 迁移密钥 | **密文直拷**，不解密再加密 | 旧组与新服务商用同一把 master key、同一 AES-GCM 布局 |
+| 迁移遇同名服务商 | **复用现有行** | 运维常常先手工登记了服务商；不复用会撞唯一索引 |
+| 执行入口 | 只剩 `POST /admin/requests/run` | 「跑整组」随组一起取消，选择任意条请求即可 |
+
+#### 18.16.3 数据模型
+
+```text
+ai_requests
+  id TEXT PK                    -- 沿用旧 request_items.id
+  provider_id TEXT NOT NULL     -- -> ai_providers.id (index)
+  name TEXT NOT NULL
+  description TEXT
+  system_prompt TEXT
+  user_prompt TEXT NOT NULL
+  prompt_vars TEXT              -- JSON map
+  sort_order INTEGER            -- ORDER 是 SQL 保留字
+  thinking_override INTEGER NULL-- NULL = 继承服务商的 thinking_enabled
+  created_at / updated_at
+```
+
+请求本身**不带密钥、不带 cipher**：上游的一切都在服务商那里。
+
+#### 18.16.4 一次性迁移
+
+`request.MigrateLegacyGroups` 在 `main` 启动时、两个 store 建好之后跑：
+
+1. `request_groups` 不存在 → 直接返回（全新安装）。
+2. 逐组：按 `name` 找已有服务商；找不到则新建，并把 `api_key_enc`
+   **原样拷过去**（不解密，密钥不会因为迁移而失效）。
+3. 逐条 `request_items`：按 `group_id` 找到映射的 provider，写入
+   `ai_requests`（保留原 id、prompt、变量、排序、时间；已存在的行只补
+   `provider_id`，因此迁移可重入）。
+4. `DROP TABLE request_items`、`DROP TABLE request_groups`。
+
+无组归属的孤儿条目没有上游坐标，记 `Orphaned` 并丢弃；正常库为 0。
+迁移幂等：成功后输入表已不存在，第二次运行是 no-op。
+
+> 用 SQLite 在线备份（含 WAL）做拷贝验证，不要直接 `cp` 主库文件 —
+> 未 checkpoint 的表只存在于 `-wal` 里，会凭空少几张表。
+
+#### 18.16.5 接口契约
+
+| Endpoint | 权限 | 说明 |
+|---|---|---|
+| `GET /admin/requests` | viewer | 扁平数组，每行内嵌只读服务商摘要 |
+| `GET /admin/requests/{id}` | viewer | 单条 |
+| `POST /admin/requests` | admin | 校验 `provider_id` 存在，否则 400 `unknown_provider` |
+| `PATCH /admin/requests/{id}` | admin | 可改指向别的服务商；未提到的字段保持原值 |
+| `DELETE /admin/requests/{id}` | admin | — |
+| `POST /admin/requests/run` | admin | `request_ids` + 可选 `overrides` / `concurrency` → 202 |
+| `GET /admin/request-batches/{id}` | viewer | 轮询 |
+
+`/admin/request-groups*` 全部下线（404）。服务商删除新增 `409 provider_in_use`。
+
+#### 18.16.6 执行链路
+
+```text
+request_ids → 逐条 GetRequest → 按 provider_id GetProvider
+  → 校验 SecretError / APIKey（失败记 skipped，不拖垮整批）
+  → ContentOverride 应用到内存副本（不落库）
+  → taskConfigFor(provider, request)：坐标取服务商，prompt 取请求
+  → probe.RunManual(opts{ProviderID, AIRequestID, BatchID})
+  → probe_runs(source=manual) 落历史，但不进指标 / 成功率 / 告警
+```
+
+#### 18.16.7 前端
+
+`RequestsView.vue` 一张平铺表格：每行显示所属服务商（名称 + 协议 + 模型），
+勾选任意行批量执行。`RequestFormModal.vue` 用下拉框选服务商；
+`RunContentModal` / `BatchResultModal` 改为按请求显示其服务商。
+`GroupFormModal.vue`、`ItemFormModal.vue`、`RequestGroupsView.vue` 已删除。
+没有服务商时页面明确提示先去登记，且「新建请求」不可点。
+
+#### 18.16.8 验收
+
+- [x] 平铺列表一次返回全部请求，无 groups 包装；不同行可属不同服务商
+- [x] 一个批次跨两个服务商，上游实际收到两个不同 model 的请求
+- [x] 结果 / `probe_runs` 均带 `provider_id` + `ai_request_id`
+- [x] 未知 `provider_id` → 400；删除被引用服务商 → 409 并列名
+- [x] PATCH 改指向另一服务商后，内嵌摘要同步刷新、prompt 不变
+- [x] 真实库副本（含 WAL）迁移：3 条请求全部保留、复用同名服务商、
+      密钥仍可解密、旧表已删、重启不重复迁移
+- [x] `go vet` / `go test -race ./...` / 前端构建全绿；
+      `e2e_request_manager.py`（70+ 断言）与 `e2e_providers.py` 全绿
+- [x] 手动执行仍不污染监控指标；定时探测仍不带 system prompt
+
+#### 18.16.9 不在范围内
+
+- ~~监控任务引用服务商~~ → 已在 §18.17 落地
+- 服务商维度的历史成功率聚合
+- 请求的版本管理 / 草稿态
+
+---
+
+### 18.17 增量 · 监控任务改为选择服务商（同 AI 请求）
+
+#### 18.17.1 目标
+
+§18.15 建了服务商注册表，§18.16 让 AI 请求改用它，但**监控任务仍然自带
+一套上游坐标**：协议、地址、密钥、模型、超时、TLS 开关、thinking 开关、
+协议专属配置，每行一份。两个任务指向同一个上游就要改两遍，凭证轮换
+要在每行上重放一次。
+
+本次改造让监控任务与 AI 请求**用同一种方式**引用上游：
+
+- 一个 `tasks` 行 = 一个探测任务（提示词 + 调度 + 灰度分组 + 通知开关）；
+- `provider_id` 指向 §18.15 的服务商，**任务自己不再存任何上游坐标**；
+- 服务商在**探测时**被解析，因此改服务商**下一个 tick 就生效**。
+
+#### 18.17.2 关键设计决策
+
+| 决策 | 选择 | 理由 |
+|---|---|---|
+| 存储模型 | `tasks` 只留自身字段 + `provider_id` | 与 `ai_requests` 同构；上游坐标一处维护 |
+| 表结构怎么改 | **重建表**（`tasks_new` → 搬数据 → 改名） | SQLite 不能给已有表加 `NOT NULL` 列，而 `provider_id` 必填 |
+| 迁移时机 | **在 GORM AutoMigrate 之前** | AutoMigrate 会先尝试 `ALTER TABLE ADD provider_id NOT NULL` 并失败 |
+| 绑定时机 | **探测时**（`provider.Binder`） | 与 `request.Service` 一致；改服务商无需重载调度器 |
+| 超时归属 | 跟随服务商 | 适配器自身不设超时，超时由调用方的 context deadline 兜住 |
+| 删除仍被引用的服务商 | **409 拒绝**，附受影响的**任务名** | 与 §18.16 对 AI 请求的保护一致 |
+| 任务写入校验 | `provider_id` 不存在 → 400 `unknown_provider` | 不让任务变成「一开局就失败」的孤儿 |
+| 通知开关 | 拆成 `enabled` 与 `notify_enabled` 两列 | 旧模型两个开关抢同一列，通知开关实际从未落库 |
+| 迁移密钥 | **密文直拷** | 旧任务与服务商用同一把 master key、同一 AES-GCM 布局 |
+| 迁移遇同端点服务商 | **复用现有行** | 运维常常先手工登记了同一个上游 |
+
+#### 18.17.3 数据模型
+
+```text
+tasks
+  id TEXT PK
+  name TEXT NOT NULL UNIQUE
+  enabled BOOLEAN NOT NULL DEFAULT 1
+  provider_id TEXT NOT NULL      -- -> ai_providers.id (index)
+  system_prompt TEXT
+  user_prompt TEXT
+  prompt_vars TEXT               -- JSON map
+  schedule TEXT NOT NULL
+  canary_group TEXT NOT NULL DEFAULT 'default'
+  notify_enabled BOOLEAN NOT NULL DEFAULT 0
+  notify_channel TEXT NOT NULL DEFAULT 'wecom'
+  notify_wecom_webhook_enc BLOB
+  created_at / updated_at
+```
+
+协议、地址、密钥、模型、超时、TLS / thinking 开关、协议专属配置在
+`config.TaskConfig` 上全部变成 `gorm:"-"` 的**运行期字段**，由
+`provider.Binder.BindTask` 在探测前填入，永不落库。
+
+#### 18.17.4 一次性迁移
+
+`provider.MigrateLegacyTasks` 在 `main` 启动时、`config.NewSqliteStoreFromDB`
+跑 AutoMigrate **之前**执行：
+
+1. `tasks` 表不存在，或已有 `provider_id` 列 → 直接返回（全新安装 /
+   已迁移）。
+2. 读旧行（协议 / 地址 / 密文 / 模型 / 超时 / TLS / thinking / 协议块）。
+3. 逐行找同端点（协议 + 地址 + 模型）的现有服务商：找到就复用，找不到
+   就新建一个（名字取任务名，撞名则加 `#2` 后缀）。旧行的 `api_key_enc`
+   **原样拷过去**，不解密再加密。
+4. 建 `tasks_new`（新结构）→ 按行写入（`provider_id` 指向第 3 步得到的
+   服务商）→ `DROP TABLE tasks` → 改名 → 重建索引。
+5. 旧 `enabled` 列（任务开关）保留为任务的 `enabled`；通知开关历史上有
+   与之抢列的问题，统一初始化为关闭（存量任务本来就没有 webhook）。
+
+迁移幂等：成功后表里没有 `protocol` 列，第二次运行是 no-op。
+
+#### 18.17.5 接口契约
+
+| Endpoint | 权限 | 说明 |
+|---|---|---|
+| `GET /admin/tasks` | viewer | 数组，每行内嵌只读服务商摘要 |
+| `GET /admin/tasks/{id}` | viewer | 单条 |
+| `POST /admin/tasks` | admin | 校验 `provider_id` 存在，否则 400 `unknown_provider` |
+| `PATCH /admin/tasks/{id}` | admin | 可改指向别的服务商；未提到的字段保持原值 |
+| `DELETE /admin/tasks/{id}` | admin | — |
+| `POST /admin/tasks/{id}/start` / `stop` | admin | 启停 cron |
+
+任务的响应体不再包含 `protocol` / `base_url` / `api_key` / `model` /
+`timeout` / `insecure_skip_verify` / `thinking_enabled`，这些都在内嵌的
+`provider` 里。服务商删除新增任务维度的保护：`409 provider_in_use`，
+`details.tasks` 列出占用它的任务名。
+
+#### 18.17.6 执行链路
+
+```text
+cron tick → scheduler → handler(ctx, task)
+  → provider.Binder.BindTask(ctx, task)
+       ├─ 查不到服务商        → 记日志跳过（不拖垮其它任务）
+       ├─ 密钥解不开 / 没有  → 记日志跳过
+       └─ 成功               → 填协议 / 地址 / 密钥 / 模型 / 超时 / TLS / thinking
+  → context.WithTimeout(provider 的 timeout)
+  → probe.Run(boundTask)
+```
+
+绑定在探测时发生，所以改服务商的下一个 tick 就生效，不需要重载调度器；
+探针记录里的 `protocol` / `model` 也自动跟随服务商。
+
+#### 18.17.7 前端
+
+`TaskFormView.vue` 改为下拉选服务商，并只读展示该服务商的上游信息
+（协议 / 模型 / 地址 / 超时 / 密钥状态）；协议、地址、密钥、模型、TLS、
+thinking、超时这些输入框全部删除。`TasksListView.vue` 的「协议 / 模型」
+两列合并成一列「服务商」，抽屉里显示服务商名称与地址；任务引用的服务商
+被删除时列表页与详情页都给出明确提示。`TaskDetailView.vue` 的上游信息改
+从内嵌服务商读取。
+
+#### 18.17.8 验收
+
+- [x] 任务响应只有 `provider_id` + 内嵌服务商，不再自带上游坐标
+- [x] 未知 `provider_id` → 400 `unknown_provider`
+- [x] 删除仍被任务引用的服务商 → 409 `provider_in_use` 并列任务名
+- [x] 定时探测经由服务商的上游完成，`probe_runs` 带服务商的协议 / 模型
+- [x] 旧库迁移：任务的上游变成服务商、密钥仍可解密、`tasks` 表重建、
+      幂等、AutoMigrate 之后无结构漂移
+- [x] `go vet` / `go test -race ./...` / 前端构建全绿；
+      `e2e_task_providers.py`、`e2e_providers.py`、`e2e_request_manager.py` 全绿
+
+#### 18.17.9 不在范围内
+
+- 服务商维度的历史成功率聚合（任务与请求混在一起，暂不区分）
+- 任务级别的上游参数覆盖（例如单个任务临时换模型）
+- 任务草稿态 / 版本管理
+
+---
+
+### 18.18 增量 · 服务商支持多模型，任务与请求各自选定一个模型
+
+#### 18.18.1 目标
+
+一个 AI 服务商可以配置多个候选模型；每个监控任务、每条 AI 请求必须且
+只能选定其中一个模型。服务商只提供候选集合，选中的模型名落在使用方自己
+的行上。§18.17.9 里「任务不能临时换模型」这条限制随之解除。
+
+#### 18.18.2 关键设计决策
+
+- **模型名数组 + 引用方存名称**，不建 `provider_models` 表、不存外键。
+  理由：与既有「按 id 引用服务商」的模式一致，改动面最小，旧数据迁移只需
+  把原单模型填进数组并回填引用方。模型改名等价于「删旧增新」，由引用守卫
+  强制先改引用方，避免出现指向不存在模型的悬空引用。
+- **撤销 §18.15 的「保存前强制连通性校验」**。多模型下逐个真实探测会把保存
+  拖到几十秒甚至触发 HTTP 写超时，且一个慢上游会阻塞整次保存。改为在模型
+  列表里对单个模型按需点「测试」，结论写回 `LastVerified*`；写载荷里的
+  `force` 保留仅为兼容旧客户端，不再有任何作用。
+- **`models` 以 JSON 数组文本持久化**，增删模型不需要改表结构。
+  `ai_providers.model` 作为遗留 `NOT NULL` 列保留（SQLite 无法原地删列），
+  每次写入镜像 `Models[0]`，**新代码禁止读取**，一律走 `Models` /
+  `PrimaryModel()`。
+- **引用守卫**：从候选列表移除一个仍被任务或请求选中的模型 →
+  409 `model_in_use`，`details` 点名冲突的请求与任务；写入时引用了服务商
+  没有的模型 → 400 `unknown_model`。
+
+#### 18.18.3 数据模型
+
+| 实体 | 字段 | 说明 |
+| --- | --- | --- |
+| `provider.Provider` | `Models []string`（运行期，`gorm:"-"`） | 有序候选列表，首项为主模型 |
+| | `ModelsJSON string`（列 `models`） | JSON 数组持久化形式 |
+| | `Model string`（列 `model`） | 遗留镜像列，写入时等于 `Models[0]` |
+| `config.TaskConfig` | `Model string`（持久化，必填） | 该任务选中的模型 |
+| `request.Request` | `Model string`（持久化，必填） | 该请求选中的模型 |
+
+辅助方法：`PrimaryModel()`、`HasModel(name)`、`NormaliseModels()`（trim /
+去空 / 去重 / 序列化 / 回填镜像列）、`HydrateModels()`。`prepareProvider`、
+`config.preWrite`、`request.prepareRequest` 都会拒绝空的模型列表 / 模型名。
+
+`probe_runs.model` 与 `BatchItemResult.model` 语义不变，仍是执行完成时
+被测模型的快照，现在来自使用方自己的 `Model`。
+
+#### 18.18.4 一次性迁移
+
+`provider.MigrateMultiModels`，**在 GORM AutoMigrate 之前**执行（`main.go`
+的迁移顺序：多模型迁移 → 请求组迁移 → 旧任务迁移 → AutoMigrate）：
+
+1. 给 `ai_providers` 加 `models` 列，把旧 `model` 转成 `[model]`；
+2. 给 `tasks`、`ai_requests` 加 `model` 列，按各自的 `provider_id` 回填
+   对应服务商的主模型，保证存量任务/请求升级后仍探测同一个模型；
+3. 全程幂等：列已存在且已回填则跳过，重复启动不会重复改写。
+
+`MigrateLegacyTasks` 重建 `tasks` 表时 INSERT 显式带上 `model` 列，把旧任务
+自带的模型带进新表。`config.fingerprintAll` 的哈希也纳入 `model`，这样
+改模型会触发调度器重载。
+
+#### 18.18.5 接口契约
+
+| 路由 | 变化 |
+| --- | --- |
+| `GET /admin/providers[/{id}]` | 响应 `models: string[]`，不再有 `model`；内嵌到任务/请求里的服务商摘要同理 |
+| `POST /admin/providers`、`PATCH /admin/providers/{id}` | 写载荷 `models: string[]`（必填，≥1 项、非空、去重）；兼容单值 `model`；不触发连通性校验、不返回 `check`、不设 `LastVerified*`；移除被引用模型 → 409 `model_in_use`，`details = {models, requests, tasks}` |
+| `POST /admin/providers/check` | 完整写载荷 + 可选 `model`（指定测哪个模型，缺省主模型）→ `CheckResult`，其中 `model` 表示本次被测模型 |
+| `POST /admin/providers/{id}/check` | 可选 `{"model":"..."}`，也可无 body（测主模型）；用存量密钥探测，结论写回 `LastVerified*`；未知模型 400 `unknown_model` |
+| `GET/POST/PATCH /admin/requests`、`/admin/tasks` | 新增 `model: string`（写载荷必填）；必须属于所选服务商的 `models`，否则 400 `unknown_model`；服务商不存在仍是 400 `unknown_provider` |
+
+`ProviderChecker` 接口改为 `CheckModel(ctx, p, model)`，一次只探测一个模型。
+
+#### 18.18.6 执行链路
+
+- 定时探测：`Binder.BindTask` 用 **task.Model**（为空回退服务商主模型），
+  若它不在服务商候选列表里返回 `provider.ErrModel`；其余上游坐标（协议、
+  地址、密钥、超时、TLS、thinking、协议块）仍由服务商注入。
+- 手动请求：`request.taskConfigFor`、`resultFrom` 与批次结果里的模型都来自
+  **request.Model**（回退服务商主模型）。
+- 因此编辑服务商的地址/密钥在下一个 tick 生效，而**换模型必须改任务或请求
+  本身**，不会悄悄把正在跑的任务切到另一个模型。
+
+#### 18.18.7 前端
+
+- 服务商表单改为可增删的多模型行：首行标注「主模型」，每行有独立的
+  「测试」按钮并显示对应模型的结论；去掉「仍然保存 / force」分支；
+  409 `model_in_use` 用 toast 展示冲突的请求/任务名。
+- AI 请求与监控任务表单新增「服务商 → 模型」二级联动下拉；切换服务商时，
+  旧模型若不在新候选列表里则默认选第一个；模型必填校验。
+- 列表、详情、抽屉、执行结果面板等只读展示统一改为显示各自选中的模型，
+  不再读 `provider.model`。中文 / 英文 i18n 同步补齐，两份结构保持一致。
+
+#### 18.18.8 验收
+
+- [x] 服务商多模型创建 / 列表 / 编辑往返，去重、非空校验
+- [x] 保存不触发连通性校验；`force` 无效；按模型测试返回该模型的结论
+- [x] 任务 / 请求写入未知模型 → 400 `unknown_model`；未知服务商 → 400 `unknown_provider`
+- [x] PATCH 移除被引用模型 → 409 `model_in_use`，冲突实体被点名且不落库
+- [x] Binder 与手动请求都用各自的 `Model`，`probe_runs` 记录正确模型
+- [x] 旧库迁移：服务商 `models` 与任务/请求 `model` 回填，幂等
+- [x] `go vet` / `go test -race ./...` / `vue-tsc` + `vite build` 全绿
+- [x] 真实库快照的一次性迁移验证（`e2e_request_migration.py`：2 个服务商 /
+      2 个任务 / 3 个请求的模型回填，含二次启动幂等）
+- [x] `e2e_providers.py` / `e2e_task_providers.py` / `e2e_request_manager.py`
+      全部通过；SPA 产物已重新构建并编进二进制
+- [ ] 常驻服务重启（原后台服务已被用户取消；真实库会在下次启动服务时自动
+      执行同一份幂等迁移）
+
+#### 18.18.9 不在范围内
+
+- 模型改名自动跟着改引用方（当前是拒绝移除 + 手工重新指定）
+- 逐模型的连通性结论与历史（只保留服务商级 `LastVerified*`，对应最后一次
+  被测的那个模型）
+- 模型级配额、权重、灰度与成本统计
+
+---
+
 
 ## A.1 sequence-diagram.mermaid
 
@@ -2065,7 +2655,7 @@ classDiagram
 
     class ConfigStore {<<interface>> +ListTasks() +GetTask() +CreateTask() +UpdateTask() +DeleteTask() +Watch() +Close()}
     class SqliteStore
-    class TaskConfig {+ID +Name +Enabled +Protocol +BaseURL +APIKey +Model +Schedule +Timeout +Notify}
+    class TaskConfig {+ID +Name +Enabled +ProviderID +SystemPrompt +UserPrompt +Schedule +CanaryGroup +Notify}
     class NotifyConfig {+Enabled +WeComWebhook}
     class AESCipher {+Encrypt() +Decrypt()}
 

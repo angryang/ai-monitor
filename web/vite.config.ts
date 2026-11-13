@@ -1,14 +1,16 @@
 import { defineConfig } from 'vite'
 import vue from '@vitejs/plugin-vue'
 
-// SPA serves under / so we keep base root-relative; build emits into ../internal/webui/assets
-// so the Go embed can pick it up unchanged.
+// SPA serves under / so we keep base root-relative. `make web-build` copies
+// dist/ into internal/webui/dist for the Go embed, so outDir must be emptied
+// on every build: hashed chunks would otherwise pile up forever and ship
+// inside the binary (including stale UI strings from old builds).
 export default defineConfig({
   plugins: [vue()],
   base: '/',
   build: {
     outDir: 'dist',
-    emptyOutDir: false,
+    emptyOutDir: true,
     assetsDir: '.',
     rollupOptions: {
       output: {

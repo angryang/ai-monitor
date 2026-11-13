@@ -30,6 +30,36 @@ const (
 	StatusUnauthorized = "unauthorized"
 )
 
+// Run sources. A run either comes from the cron scheduler or from an
+// operator-triggered batch (the AI request manager).
+const (
+	SourceSchedule = "schedule"
+	SourceManual   = "manual"
+)
+
+// RunOptions carries the optional side-effect switches of a run.
+type RunOptions struct {
+	// Manual marks an operator-triggered, one-shot execution.
+	//
+	// Manual runs are ad-hoc probes, not monitoring samples: they are
+	// recorded in the run history but they never touch the Prometheus
+	// metrics, the success-rate window, the consecutive-failure counter or
+	// the notification channel. Without this, a manual smoke test that
+	// happens to time out would look like a monitoring failure, pollute
+	// the task's success rate and could page somebody.
+	Manual bool
+	// BatchID groups the runs of one manual batch execution. Empty for
+	// scheduled runs.
+	BatchID string
+	// ProviderID / AIRequestID identify the AI service provider and the
+	// AI request that produced the run. Both are empty for scheduled runs.
+	//
+	// AIRequestID is spelled out rather than "RequestID" because that
+	// name already belongs to the upstream's X-Req-Id.
+	ProviderID  string
+	AIRequestID string
+}
+
 // Result summarizes one probe execution. The runner is also responsible for
 // owning it; tests assert on these fields.
 type Result struct {
@@ -49,24 +79,34 @@ type Result struct {
 	// §18.13 — request / response capture. Captured by the protocol
 	// adapter's ProbeStream; the runner pulls these after the chunk
 	// loop closes so we know all bytes have been observed.
-	RequestID        string
-	RequestBody      []byte
-	ResponseHead     []byte
-	ResponseTail     []byte
+	RequestID         string
+	RequestBody       []byte
+	ResponseHead      []byte
+	ResponseTail      []byte
 	ResponseTruncated bool
-	RequestTruncated bool
+	RequestTruncated  bool
 
 	// §18.14 — semantic content. InputContent is derived from the task
 	// config (variables already expanded), ThinkingContent comes from the
 	// adapter's in-flight capture, OutputContent is accumulated from the
 	// content chunks.
-	InputContent      string
-	ThinkingContent   string
-	OutputContent     string
-	ContentTruncated  bool
+	InputContent     string
+	ThinkingContent  string
+	OutputContent    string
+	ContentTruncated bool
 	// ResponseErrorBody holds the (bounded) body of a failed response.
 	// Empty on success.
 	ResponseErrorBody string
+
+	// Source says where the run came from: SourceSchedule for a cron tick,
+	// SourceManual for an operator-triggered batch.
+	Source string
+	// BatchID groups the runs of one manual batch execution.
+	BatchID string
+	// ProviderID / AIRequestID identify the AI service provider and the
+	// AI request that produced a manual run. Empty for scheduled runs.
+	ProviderID  string
+	AIRequestID string
 }
 
 // Duration computes the wall-clock duration of the probe.
@@ -131,14 +171,55 @@ func NewRunner(adapters AdapterLookup, sink metrics.MetricSink, n notifier.Notif
 // Run executes one probe against the upstream API described by t. The caller
 // must pass a context with a deadline matching t.Timeout; the runner
 // otherwise doesn't enforce timeouts because the adapter does.
+//
+// The run is a monitoring sample: it feeds the Prometheus metrics, the
+// success-rate window and the notification channel. Use RunManual for
+// operator-triggered, one-shot executions.
+//
+// Monitoring tasks send only their user prompt — a scheduled probe is a
+// liveness check, not a conversation. Any legacy system_prompt still stored
+// in SQLite or written into a YAML task is cleared here so it never reaches
+// an adapter. RunManual (used by AI request groups) keeps its own system
+// prompt, because those requests are fully authored by the operator.
 func (r *Runner) Run(ctx context.Context, t config.TaskConfig) Result {
+	t.SystemPrompt = ""
+	return r.run(ctx, t, RunOptions{})
+}
+
+// RunManual executes one ad-hoc probe on behalf of an operator.
+//
+// The probe mechanics are identical to Run — same adapters, same stream
+// handling, same capture — but the monitoring side effects are skipped: no
+// Prometheus samples, no success-rate window update, no notification. The
+// run is still recorded in the history (Source = SourceManual) so the
+// operator can look up what happened.
+//
+// The caller must pass a context with a deadline matching t.Timeout.
+func (r *Runner) RunManual(ctx context.Context, t config.TaskConfig, opts RunOptions) Result {
+	opts.Manual = true
+	return r.run(ctx, t, opts)
+}
+
+// run is the shared body of Run and RunManual.
+func (r *Runner) run(ctx context.Context, t config.TaskConfig, opts RunOptions) Result {
 	res := Result{
-		TaskID:   t.ID,
-		TaskName: t.Name,
-		Protocol: string(t.Protocol),
-		Model:    t.Model,
-		Status:   StatusFailure,
+		TaskID:      t.ID,
+		TaskName:    t.Name,
+		Protocol:    string(t.Protocol),
+		Model:       t.Model,
+		Status:      StatusFailure,
+		Source:      SourceSchedule,
+		BatchID:     opts.BatchID,
+		ProviderID:  opts.ProviderID,
+		AIRequestID: opts.AIRequestID,
 	}
+	if opts.Manual {
+		res.Source = SourceManual
+	}
+	// Manual runs must not influence the monitoring signal, so every
+	// metrics / window / notification call below is gated on this flag.
+	// The probe mechanics and the history write are not.
+	skipMonitoring := opts.Manual
 	// Persist at the very end, regardless of which return path we take.
 	// Note: defer captures function arguments at the defer statement, so
 	// passing &res is critical — if we passed res by value, this deferred
@@ -152,28 +233,35 @@ func (r *Runner) Run(ctx context.Context, t config.TaskConfig) Result {
 		slog.String("task_name", t.Name),
 		slog.String("protocol", res.Protocol),
 		slog.String("model", res.Model),
+		slog.String("source", res.Source),
 	)
 
 	adapter, err := r.Adapters(string(t.Protocol))
 	if err != nil {
 		res.Err = fmt.Errorf("lookup adapter: %w", err)
 		log.Warn("adapter_lookup_failed", slog.String("err", res.Err.Error()))
-		r.sinkFailure(t, "protocol_error", 0, log)
-		r.maybeAlert(t, res, log)
+		if !skipMonitoring {
+			r.sinkFailure(t, "protocol_error", 0, log)
+			r.maybeAlert(t, res, log)
+		}
 		return res
 	}
 	if err := t.ValidateProtocolSegments(); err != nil {
 		res.Err = fmt.Errorf("task config: %w", err)
 		log.Warn("task_validate_failed", slog.String("err", res.Err.Error()))
-		r.sinkFailure(t, "4xx", 0, log)
-		r.maybeAlert(t, res, log)
+		if !skipMonitoring {
+			r.sinkFailure(t, "4xx", 0, log)
+			r.maybeAlert(t, res, log)
+		}
 		return res
 	}
 	if verr := adapter.Validate(&t); verr != nil {
 		res.Err = fmt.Errorf("validate: %w", verr)
 		log.Warn("adapter_validate_failed", slog.String("err", res.Err.Error()))
-		r.sinkFailure(t, "protocol_error", 0, log)
-		r.maybeAlert(t, res, log)
+		if !skipMonitoring {
+			r.sinkFailure(t, "protocol_error", 0, log)
+			r.maybeAlert(t, res, log)
+		}
 		return res
 	}
 
@@ -202,17 +290,27 @@ func (r *Runner) Run(ctx context.Context, t config.TaskConfig) Result {
 		switch {
 		case errors.Is(err, protocol.ErrUnauthorized):
 			res.Status = StatusUnauthorized
-			r.sinkFailure(t, "unauthorized", res.Duration(), log)
+			if !skipMonitoring {
+				r.sinkFailure(t, "unauthorized", res.Duration(), log)
+			}
 		case errors.Is(err, protocol.ErrUpstreamDown):
-			r.sinkFailure(t, "5xx", res.Duration(), log)
+			if !skipMonitoring {
+				r.sinkFailure(t, "5xx", res.Duration(), log)
+			}
 		case errors.Is(err, protocol.ErrProtocolCfg):
-			r.sinkFailure(t, "4xx", res.Duration(), log)
+			if !skipMonitoring {
+				r.sinkFailure(t, "4xx", res.Duration(), log)
+			}
 		default:
-			r.sinkFailure(t, "timeout", res.Duration(), log)
+			if !skipMonitoring {
+				r.sinkFailure(t, "timeout", res.Duration(), log)
+			}
 		}
 		log.Warn("probe_open_failed", slog.String("status", res.Status), slog.String("err", res.Err.Error()))
-		r.updateSlider(t.ID, false)
-		r.maybeAlert(t, res, log)
+		if !skipMonitoring {
+			r.updateSlider(t.ID, false)
+			r.maybeAlert(t, res, log)
+		}
 		return res
 	}
 	defer stream.Close()
@@ -252,7 +350,9 @@ func (r *Runner) Run(ctx context.Context, t config.TaskConfig) Result {
 					res.ITLSum = 0
 				}
 				sec := float64(res.ITLSum.Seconds()) / float64(res.ITLCount)
-				r.Sink.ObserveITL(t.ID, res.Protocol, res.Model, sec)
+				if !skipMonitoring {
+					r.Sink.ObserveITL(t.ID, res.Protocol, res.Model, sec)
+				}
 			}
 		}
 		if chunk.IsFinal {
@@ -262,12 +362,13 @@ func (r *Runner) Run(ctx context.Context, t config.TaskConfig) Result {
 	res.EndedAt = time.Now().UTC()
 	if err := stream.Err(); err != nil {
 		res.Err = err
-		if errors.Is(err, context.Canceled) {
-			res.Status = StatusFailure
-			r.sinkFailure(t, "timeout", res.Duration(), log)
-		} else {
-			res.Status = StatusFailure
-			r.sinkFailure(t, "protocol_error", res.Duration(), log)
+		res.Status = StatusFailure
+		if !skipMonitoring {
+			if errors.Is(err, context.Canceled) {
+				r.sinkFailure(t, "timeout", res.Duration(), log)
+			} else {
+				r.sinkFailure(t, "protocol_error", res.Duration(), log)
+			}
 		}
 	} else {
 		res.Status = StatusSuccess
@@ -293,19 +394,22 @@ func (r *Runner) Run(ctx context.Context, t config.TaskConfig) Result {
 	res.ContentTruncated = capture.Truncated || outputAcc.Truncated()
 
 	// Emit TTFT + duration metrics. We use wall-clock so cross-process
-	// aggregations in PromQL match ingest times.
-	if res.TTFT > 0 {
-		r.Sink.ObserveTTFT(t.ID, res.Protocol, res.Model, res.TTFT.Seconds())
-	}
-	r.Sink.ObserveDuration(t.ID, res.Protocol, res.Model, res.Status, res.Duration().Seconds())
-	r.Sink.IncChunk(t.ID, res.Protocol, res.Model, res.Chunks)
-	if res.Status == StatusSuccess {
-		r.Sink.SetTaskLastSuccess(t.ID, res.EndedAt)
-	}
+	// aggregations in PromQL match ingest times. Manual runs skip this
+	// block: an ad-hoc probe is not a monitoring sample.
+	if !skipMonitoring {
+		if res.TTFT > 0 {
+			r.Sink.ObserveTTFT(t.ID, res.Protocol, res.Model, res.TTFT.Seconds())
+		}
+		r.Sink.ObserveDuration(t.ID, res.Protocol, res.Model, res.Status, res.Duration().Seconds())
+		r.Sink.IncChunk(t.ID, res.Protocol, res.Model, res.Chunks)
+		if res.Status == StatusSuccess {
+			r.Sink.SetTaskLastSuccess(t.ID, res.EndedAt)
+		}
 
-	// Slider + alert evaluation.
-	r.updateSlider(t.ID, res.Status == StatusSuccess)
-	r.maybeAlert(t, res, log)
+		// Slider + alert evaluation.
+		r.updateSlider(t.ID, res.Status == StatusSuccess)
+		r.maybeAlert(t, res, log)
+	}
 
 	log.Info("probe_done",
 		slog.String("status", res.Status),

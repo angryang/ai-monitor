@@ -71,6 +71,21 @@ type LenientTaskGetter interface {
 	GetTaskLenient(ctx context.Context, id string) (*TaskConfig, error)
 }
 
+// TaskProviderLister is an optional extension of ConfigStore implemented by
+// stores that can answer "which tasks point at this provider?".
+//
+// The provider delete route uses it to refuse removing a provider that is
+// still in use. A task whose provider disappeared would keep probing a
+// dangling id and fail on every tick, so the deletion has to be blocked
+// while the operator re-points the task.
+//
+// It is an optional interface (the caller uses a type assertion) so
+// ConfigStore itself stays unchanged and test doubles don't have to
+// implement the extra method.
+type TaskProviderLister interface {
+	ListTasksByProvider(ctx context.Context, providerID string) ([]TaskConfig, error)
+}
+
 // Sentinel errors returned by ConfigStore implementations. Callers MUST
 // use errors.Is/As to match them.
 var (

@@ -25,6 +25,13 @@ dedup_ttl: 5m
 #                   to a single endpoint.
 insecure_skip_verify: false
 
+# AI service provider registry.
+#
+# A provider is only persisted after the upstream accepted a request with
+# its own credentials and model. This bounds how long that check may take
+# — it also bounds how long the admin API holds the save request open.
+provider_check_timeout: 10s
+
 # Buckets (per design.md §11.6.1)
 buckets_default: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30]
 buckets_ttft:    [0.01, 0.025, 0.05, 0.1, 0.2, 0.35, 0.5, 0.75, 1, 2, 5]
@@ -32,23 +39,25 @@ buckets_itl:     [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5]
 buckets_duration: [0.1, 0.25, 0.5, 1, 2.5, 5, 10, 20, 30, 60, 120]
 buckets_lag:     [0.01, 0.05, 0.1, 0.5, 1, 5, 30, 60]
 
+# Example monitoring task.
+#
+# A task names the AI service provider it probes; the upstream coordinates
+# (protocol, base URL, api key, model, timeout, TLS / thinking switches)
+# live on the provider — see the 「AI 服务商」 page or /admin/providers.
+# The api key never belongs in this file: it is sealed with the instance
+# master key and stored in SQLite.
+#
+# Tasks are normally created through the admin API (POST /admin/tasks);
+# this block only documents the shape.
 tasks:
   - name: prod-openai-gpt4o
     enabled: true
-    protocol: openai
-    base_url: https://api.openai.com
-    model: gpt-4o
+    provider_id: "" # <- ai_providers.id
     schedule: "*/30 * * * * *"
-    timeout: 30s
     user_prompt: "Say hi at ${today}"
     prompt_vars:
       today: "{{.Now.Date}}"
-    # Skip upstream cert verification for this task only — set when the
-    # endpoint serves a self-signed cert or a private CA. Leave off for
-    # public endpoints (MITM protection).
-    insecure_skip_verify: false
-    openai:
-      stream_path: /v1/chat/completions
+    canary_group: default
     notify:
       enabled: false
       channel: wecom

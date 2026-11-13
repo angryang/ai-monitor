@@ -34,6 +34,8 @@ import (
 	_ "github.com/angryang/ai-monitor/internal/protocol/anthropic"
 	_ "github.com/angryang/ai-monitor/internal/protocol/gemini"
 	_ "github.com/angryang/ai-monitor/internal/protocol/openai"
+	"github.com/angryang/ai-monitor/internal/provider"
+	"github.com/angryang/ai-monitor/internal/request"
 	"github.com/angryang/ai-monitor/internal/scheduler"
 	"github.com/angryang/ai-monitor/internal/server"
 )
@@ -72,9 +74,101 @@ func run() error {
 		return fmt.Errorf("cipher: %w", err)
 	}
 
-	store, err := config.NewSqliteStore(config.SqliteOptions{Path: cfg.SQLitePath})
+	// The root context: cancelled on shutdown so in-flight probes and the
+	// scheduler stop together.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// The database handle is opened before any migration runs: the
+	// legacy monitoring-task migration has to rewrite the `tasks` table
+	// *before* GORM's AutoMigrate sees it, because SQLite cannot add a
+	// NOT NULL column to an existing table and the new task model
+	// declares `provider_id` as NOT NULL.
+	db, err := config.OpenDB(cfg.SQLitePath, 0)
 	if err != nil {
 		return fmt.Errorf("open sqlite: %w", err)
+	}
+	sqlDB, err := db.DB()
+	if err != nil {
+		return fmt.Errorf("open sqlite: %w", err)
+	}
+	defer func() { _ = sqlDB.Close() }()
+
+	// §18.18: the multi-model upgrade adds `models` to ai_providers and
+	// `model` to tasks / ai_requests, then backfills every existing row
+	// with the model it was already using. It has to run before any
+	// AutoMigrate: SQLite refuses to add a NOT NULL column without a
+	// default, which is exactly what GORM would otherwise attempt.
+	mmres, err := provider.MigrateMultiModels(ctx, db, log)
+	if err != nil {
+		return fmt.Errorf("multi-model migration: %w", err)
+	}
+	if mmres.ProvidersBackfilled > 0 || mmres.TasksBackfilled > 0 || mmres.RequestsBackfilled > 0 {
+		log.Info("multi-model migration complete",
+			"providers", mmres.ProvidersBackfilled,
+			"tasks", mmres.TasksBackfilled,
+			"requests", mmres.RequestsBackfilled)
+	}
+
+	// AI service provider registry. The store shares the task store's
+	// GORM handle so everything lives in the same SQLite file; the
+	// checker verifies that a provider is reachable before it is saved.
+	providerStore, err := provider.NewSqliteStore(db)
+	if err != nil {
+		return fmt.Errorf("provider store: %w", err)
+	}
+	providerStore.SetCipher(cipher)
+	providerChecker := provider.NewChecker(provider.CheckerOptions{
+		Adapters: func(name string) (protocol.ChatProtocolAdapter, error) {
+			return protocol.Lookup(name)
+		},
+		Timeout: cfg.ProviderCheckTimeout,
+		Logger:  log,
+	})
+
+	// AI request manager: a flat registry of predefined requests, each
+	// pointing at one provider. Requests no longer carry upstream
+	// coordinates (or a cipher) of their own — the provider owns all of
+	// that.
+	requestStore, err := request.NewSqliteStore(db)
+	if err != nil {
+		return fmt.Errorf("request store: %w", err)
+	}
+
+	// One-time migration of the retired request_groups / request_items
+	// model. Legacy groups become providers and their items become
+	// requests pointing at those providers. No prompt or credential is
+	// lost; the old tables are dropped once they are empty.
+	mres, err := request.MigrateLegacyGroups(ctx, db, providerStore, log)
+	if err != nil {
+		return fmt.Errorf("request groups migration: %w", err)
+	}
+	if mres.GroupsMigrated > 0 || mres.ProvidersReused > 0 || mres.RequestsMigrated > 0 {
+		log.Info("request_groups migrated",
+			"groups", mres.GroupsMigrated,
+			"providers_reused", mres.ProvidersReused,
+			"requests", mres.RequestsMigrated,
+			"orphaned", mres.Orphaned)
+	}
+
+	// One-time migration of the retired "task owns the upstream" model.
+	// Every legacy task's upstream becomes a provider and the `tasks`
+	// table is rebuilt so it only holds task-owned fields plus the
+	// provider reference.
+	tres, err := provider.MigrateLegacyTasks(ctx, db, providerStore, log)
+	if err != nil {
+		return fmt.Errorf("monitoring task migration: %w", err)
+	}
+	if tres.TasksMigrated > 0 {
+		log.Info("monitoring tasks migrated",
+			"tasks", tres.TasksMigrated,
+			"providers_created", tres.ProvidersCreated,
+			"providers_reused", tres.ProvidersReused)
+	}
+
+	store, err := config.NewSqliteStoreFromDB(db, config.SqliteOptions{Path: cfg.SQLitePath})
+	if err != nil {
+		return fmt.Errorf("open task store: %w", err)
 	}
 	store.SetCipher(cipher)
 
@@ -106,9 +200,6 @@ func run() error {
 		return fmt.Errorf("auth: seed admin: %w", err)
 	}
 	mw := auth.NewMiddleware(signer, userStore)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 
 	// Probe dependencies.
 	sink := metrics.NewPromSink(metrics.PrometheusOptions{
@@ -143,6 +234,17 @@ func run() error {
 	}
 	runner.RunStore = runStore
 
+	requestSvc := request.NewService(requestStore, runner, request.ServiceOptions{
+		Providers: providerStore,
+		Logger:    log,
+	})
+
+	// The binder resolves the AI service provider a task points at and
+	// copies the upstream coordinates onto the task's runtime fields right
+	// before a probe runs. Binding at probe time (instead of at load time)
+	// is what makes a provider edit take effect on the very next tick.
+	binder := provider.NewBinder(providerStore)
+
 	// Make sure scheduler handler captures task context.
 	schedulerLog := func(msg string, args ...any) {
 		log.Info(msg, args...)
@@ -152,7 +254,19 @@ func run() error {
 		Jitter:        cfg.Jitter,
 		Logger:        schedulerLog,
 		Handler: func(_ context.Context, t config.TaskConfig) {
-			runner.Run(ctx, t)
+			bound, err := binder.BindTask(ctx, t)
+			if err != nil {
+				// A task whose provider vanished (or lost its key) must
+				// not take the whole tick down: log it and move on.
+				log.Warn("probe task could not be bound to its provider",
+					"task_id", t.ID, "task_name", t.Name, "error", err.Error())
+				return
+			}
+			// The provider owns the per-request deadline; the adapter
+			// does not enforce a timeout of its own.
+			runCtx, runCancel := context.WithTimeout(ctx, bound.EffectiveTimeout())
+			defer runCancel()
+			runner.Run(runCtx, bound)
 		},
 	})
 
@@ -183,15 +297,23 @@ func run() error {
 	}
 
 	httpSrv := server.New(server.Options{
-		Addr:      cfg.HTTPAddr,
-		Metrics:   sink.Handler(),
-		Store:     store,
-		Scheduler: sched,
-		Logger:    func(msg string, args ...any) { log.Info(msg, args...) },
-		Auth:      mw,
-		UserStore: userStore,
-		RunStore:  runStore,
-		InsecureSkipVerify: cfg.InsecureSkipVerify,
+		Addr:                 cfg.HTTPAddr,
+		Metrics:              sink.Handler(),
+		Store:                store,
+		Scheduler:            sched,
+		Logger:               func(msg string, args ...any) { log.Info(msg, args...) },
+		Auth:                 mw,
+		UserStore:            userStore,
+		RunStore:             runStore,
+		InsecureSkipVerify:   cfg.InsecureSkipVerify,
+		RequestStore:         requestStore,
+		RequestService:       requestSvc,
+		ProviderStore:        providerStore,
+		ProviderChecker:      providerChecker,
+		ProviderCheckTimeout: cfg.ProviderCheckTimeout,
+		// The provider save path waits for an upstream call, so the
+		// response deadline has to outlast the check.
+		WriteTimeout: cfg.ProviderCheckTimeout + 5*time.Second,
 	})
 
 	// Hot reload coordinator.

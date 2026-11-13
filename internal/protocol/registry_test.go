@@ -15,9 +15,11 @@ import (
 
 type stubAdapter struct{ name string }
 
-func (s *stubAdapter) Name() string                                       { return s.name }
-func (s *stubAdapter) Validate(_ *config.TaskConfig) error                { return nil }
-func (s *stubAdapter) Probe(_ context.Context, _ *config.TaskConfig) (ProbeStream, error) { return nil, nil }
+func (s *stubAdapter) Name() string                        { return s.name }
+func (s *stubAdapter) Validate(_ *config.TaskConfig) error { return nil }
+func (s *stubAdapter) Probe(_ context.Context, _ *config.TaskConfig) (ProbeStream, error) {
+	return nil, nil
+}
 
 func TestRegistry_RegisterAndGet(t *testing.T) {
 	defer Reset()

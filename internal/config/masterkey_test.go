@@ -30,7 +30,8 @@ func TestMasterKeyMismatch_ListTasksLenientKeepsTask(t *testing.T) {
 	}
 	store.SetCipher(cipherA)
 
-	tc := sampleOpenAI("t-key", "prod")
+	tc := sampleTask("t-key", "prod")
+	tc.Notify.WeComWebhook = "https://wecom.test/hook"
 	if err := store.CreateTask(ctx, tc); err != nil {
 		t.Fatalf("create: %v", err)
 	}
@@ -68,14 +69,14 @@ func TestMasterKeyMismatch_ListTasksLenientKeepsTask(t *testing.T) {
 	if got.SecretError == "" {
 		t.Error("SecretError should be set on the returned task")
 	}
-	if got.APIKey != "" {
-		t.Errorf("APIKey should be empty when it could not be decrypted, got %q", got.APIKey)
+	if got.Notify.WeComWebhook != "" {
+		t.Errorf("the webhook should be empty when it could not be decrypted, got %q", got.Notify.WeComWebhook)
 	}
 	if got.Runnable() {
 		t.Error("a task with undecryptable secrets must not be runnable")
 	}
 	// The non-secret fields survive, so the task can be repaired in place.
-	if got.BaseURL != tc.BaseURL || got.Model != tc.Model || got.Schedule != tc.Schedule {
+	if got.ProviderID != tc.ProviderID || got.Schedule != tc.Schedule {
 		t.Errorf("non-secret fields were lost: %+v", got)
 	}
 }
@@ -92,7 +93,9 @@ func TestMasterKeyMismatch_GetTaskLenientKeepsTask(t *testing.T) {
 		t.Fatalf("cipher A: %v", err)
 	}
 	store.SetCipher(cipherA)
-	if err := store.CreateTask(ctx, sampleOpenAI("t-key2", "prod")); err != nil {
+	seed := sampleTask("t-key2", "prod")
+	seed.Notify.WeComWebhook = "https://wecom.test/hook"
+	if err := store.CreateTask(ctx, seed); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 
@@ -115,10 +118,10 @@ func TestMasterKeyMismatch_GetTaskLenientKeepsTask(t *testing.T) {
 	if got.SecretError == "" {
 		t.Error("SecretError should be set")
 	}
-	if got.APIKey != "" {
-		t.Errorf("APIKey should be empty, got %q", got.APIKey)
+	if got.Notify.WeComWebhook != "" {
+		t.Errorf("the webhook should be empty, got %q", got.Notify.WeComWebhook)
 	}
-	if got.BaseURL == "" {
+	if got.ProviderID == "" {
 		t.Error("non-secret fields should survive")
 	}
 }
@@ -135,7 +138,9 @@ func TestMasterKeyMismatch_ReEnterAPIKeyRecoversTask(t *testing.T) {
 		t.Fatalf("cipher A: %v", err)
 	}
 	store.SetCipher(cipherA)
-	if err := store.CreateTask(ctx, sampleOpenAI("t-key3", "prod")); err != nil {
+	seed := sampleTask("t-key3", "prod")
+	seed.Notify.WeComWebhook = "https://wecom.test/hook"
+	if err := store.CreateTask(ctx, seed); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 
@@ -145,12 +150,12 @@ func TestMasterKeyMismatch_ReEnterAPIKeyRecoversTask(t *testing.T) {
 	}
 	store.SetCipher(cipherB)
 
-	// Operator re-enters the api key via the normal update path.
+	// Operator re-enters the webhook via the normal update path.
 	row, err := store.GetTaskLenient(ctx, "t-key3")
 	if err != nil {
 		t.Fatalf("GetTaskLenient: %v", err)
 	}
-	row.APIKey = "sk-recovered"
+	row.Notify.WeComWebhook = "https://wecom.test/hook-2"
 	if err := store.UpdateTask(ctx, row); err != nil {
 		t.Fatalf("update: %v", err)
 	}
@@ -163,8 +168,8 @@ func TestMasterKeyMismatch_ReEnterAPIKeyRecoversTask(t *testing.T) {
 	if len(tasks) != 1 {
 		t.Fatalf("expected 1 task, got %d", len(tasks))
 	}
-	if tasks[0].APIKey != "sk-recovered" {
-		t.Errorf("APIKey = %q, want %q", tasks[0].APIKey, "sk-recovered")
+	if tasks[0].Notify.WeComWebhook != "https://wecom.test/hook-2" {
+		t.Errorf("webhook = %q, want %q", tasks[0].Notify.WeComWebhook, "https://wecom.test/hook-2")
 	}
 	if !tasks[0].Runnable() {
 		t.Error("task should be runnable again after the secret was re-entered")
@@ -192,7 +197,7 @@ func TestRunnableTasks_FiltersUndecryptable(t *testing.T) {
 func TestListTasksLenient_ReportsListFailure(t *testing.T) {
 	store := newTestStore(t)
 	ctx := context.Background()
-	if err := store.CreateTask(ctx, sampleOpenAI("t-listfail", "prod")); err != nil {
+	if err := store.CreateTask(ctx, sampleTask("t-listfail", "prod")); err != nil {
 		t.Fatalf("create: %v", err)
 	}
 	// Closing the store makes every subsequent query fail.

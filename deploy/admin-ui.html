@@ -183,7 +183,6 @@
         <label>BaseURL *</label>  <input v-model="editing.BaseURL" placeholder="https://api.openai.com" />
         <label>API Key *</label>  <input type="password" v-model="editing.APIKeyPlain" placeholder="sk-...（保存时加密入库）" />
         <label>模型 *</label>     <input v-model="editing.Model" placeholder="gpt-4o / claude-3-5-sonnet / gemini-1.5-pro" />
-        <label>System Prompt</label>   <textarea v-model="editing.SystemPrompt"></textarea>
         <label>User Prompt *</label>   <textarea v-model="editing.UserPrompt"></textarea>
         <label>Schedule *</label>      <input v-model="editing.Schedule" placeholder="*/30 * * * * *（秒级 cron）" />
         <label>Timeout (sec)</label>   <input v-model.number="editing.TimeoutSec" type="number" min="1" max="600" />
@@ -293,7 +292,6 @@ createApp({
         BaseURL: t.BaseURL,
         APIKeyPlain: "(已加密存盘，不可回显)",
         Model: t.Model,
-        SystemPrompt: t.SystemPrompt || "",
         UserPrompt: t.UserPrompt,
         Schedule: t.Schedule,
         TimeoutSec: (t.TimeoutMS || 30000) / 1000,
@@ -321,7 +319,7 @@ createApp({
       return {
         ID: "", Name: "", Protocol: "openai",
         BaseURL: "", APIKeyPlain: "", Model: "gpt-4o",
-        SystemPrompt: "", UserPrompt: "Say hi at {{.Now.Date}}",
+        UserPrompt: "Say hi at {{.Now.Date}}",
         Schedule: "*/30 * * * * *", TimeoutSec: 30,
         CanaryGroup: "default",
         OpenAI: { StreamPath: "", ExtraHeadersJSON: "" },

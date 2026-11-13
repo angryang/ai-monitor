@@ -106,9 +106,16 @@ async function onStop() {
       <div class="detail__card">
         <h4>{{ t('task.detail.identity') }}</h4>
         <dl>
-          <dt>{{ t('task.detail.protocol') }}</dt><dd><Badge tone="accent">{{ task.protocol }}</Badge></dd>
-          <dt>{{ t('task.detail.model') }}</dt><dd class="text-mono">{{ task.model }}</dd>
-          <dt>{{ t('task.detail.baseUrl') }}</dt><dd class="text-mono">{{ task.base_url }}</dd>
+          <dt>{{ t('task.col.provider') }}</dt>
+          <dd>
+            <template v-if="task.provider">
+              <Badge tone="accent">{{ task.provider.protocol }}</Badge>
+              <span class="text-mono">{{ task.provider.name }}</span>
+            </template>
+            <span v-else class="detail__orphan">{{ t('task.list.orphanBadge') }}</span>
+          </dd>
+          <dt>{{ t('task.detail.model') }}</dt><dd class="text-mono">{{ task.model ?? '—' }}</dd>
+          <dt>{{ t('task.detail.baseUrl') }}</dt><dd class="text-mono">{{ task.provider?.base_url ?? '—' }}</dd>
           <dt>{{ t('task.detail.canary') }}</dt><dd class="text-mono">{{ task.canary_group }}</dd>
           <dt>{{ t('task.detail.enabled') }}</dt>
           <dd>
@@ -122,14 +129,17 @@ async function onStop() {
         <h4>{{ t('task.detail.schedule') }}</h4>
         <dl>
           <dt>{{ t('task.detail.cron') }}</dt><dd class="text-mono">{{ task.schedule }}</dd>
-          <dt>{{ t('task.detail.timeout') }}</dt><dd class="text-mono">{{ task.timeout }}</dd>
-          <dt>{{ t('task.detail.apiKey') }}</dt><dd>{{ task.has_api_key ? t('task.detail.configured') : t('task.detail.notSet') }}</dd>
+          <dt>{{ t('task.detail.timeout') }}</dt><dd class="text-mono">{{ task.provider?.timeout ?? '—' }}</dd>
+          <dt>{{ t('task.detail.apiKey') }}</dt>
+          <dd>
+            <span v-if="task.provider?.secret_error" class="detail__orphan">{{ t('task.list.secretErrorBadge') }}</span>
+            <span v-else>{{ task.provider?.has_api_key ? t('task.detail.configured') : t('task.detail.notSet') }}</span>
+          </dd>
           <dt>{{ t('task.detail.webhook') }}</dt><dd>{{ task.notify.has_webhook ? t('task.detail.configured') : t('task.detail.notSet') }}</dd>
         </dl>
       </div>
       <div class="detail__card detail__card--wide">
         <h4>{{ t('task.detail.prompts') }}</h4>
-        <p class="detail__prompt"><span class="text-muted">{{ t('task.detail.systemLabel') }}</span> {{ task.system_prompt || t('task.detail.notSet') }}</p>
         <p class="detail__prompt"><span class="text-muted">{{ t('task.detail.userLabel') }}</span> {{ task.user_prompt }}</p>
         <p class="text-mono text-muted">{{ t('task.detail.vars', { json: JSON.stringify(task.prompt_vars) }) }}</p>
       </div>
@@ -187,4 +197,5 @@ async function onStop() {
 .detail__card dt { color: var(--muted); font-size: var(--fs-11); font-family: var(--font-mono); text-transform: uppercase; letter-spacing: 0.06em; }
 .detail__card dd { margin: 0; font-size: var(--fs-13); }
 .detail__prompt { font-size: var(--fs-13); margin: 0 0 var(--space-2); }
+.detail__orphan { color: var(--danger); font-weight: var(--fw-semibold); }
 </style>

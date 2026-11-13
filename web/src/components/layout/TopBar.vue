@@ -20,6 +20,8 @@ const breadcrumb = computed(() => {
   if (path.match(/^\/tasks\/[^/]+/)) return t('crumb.tasksDetail')
   if (path === '/tasks' || path === '/') return t('crumb.tasks')
   if (path === '/metrics') return t('crumb.metrics')
+  if (path === '/requests') return t('crumb.requests')
+  if (path === '/providers') return t('crumb.providers')
   if (path === '/users') return t('crumb.users')
   if (path === '/profile') return t('crumb.profile')
   return t('crumb.fallback')

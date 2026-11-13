@@ -78,13 +78,13 @@ func (s *SqliteRunStore) ListByTask(ctx context.Context, taskID string, limit in
 // recent rows per task and delete the rest. Implemented as one DELETE with
 // a subquery — O(N) once per Save, not a per-task hot loop.
 //
-//   DELETE FROM probe_runs
-//   WHERE id NOT IN (
-//     SELECT id FROM probe_runs pr
-//     WHERE pr.task_id = probe_runs.task_id
-//     ORDER BY pr.started_at DESC, pr.id DESC
-//     LIMIT :keep
-//   )
+//	DELETE FROM probe_runs
+//	WHERE id NOT IN (
+//	  SELECT id FROM probe_runs pr
+//	  WHERE pr.task_id = probe_runs.task_id
+//	  ORDER BY pr.started_at DESC, pr.id DESC
+//	  LIMIT :keep
+//	)
 //
 // SQLite evaluates the subquery per outer row, which is fine at our scale
 // (hundreds of tasks × hundreds of rows). If the table grows to millions
@@ -108,6 +108,37 @@ WHERE id NOT IN (
 		return fmt.Errorf("probe_runs: prune: %w", err)
 	}
 	return nil
+}
+
+// ListManual returns the most recent manually triggered runs matching the
+// filter, newest first.
+//
+// The runs are selected by source = 'manual' so a scheduled tick can never
+// leak into the AI-request-manager history. The optional batch / group /
+// item filters narrow the result further.
+func (s *SqliteRunStore) ListManual(ctx context.Context, filter ManualRunFilter) ([]ProbeRun, error) {
+	limit := filter.Limit
+	if limit <= 0 {
+		return nil, fmt.Errorf("probe_runs: limit must be > 0 (got %d)", limit)
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	q := s.db.WithContext(ctx).Where("source = ?", SourceManual)
+	if filter.BatchID != "" {
+		q = q.Where("batch_id = ?", filter.BatchID)
+	}
+	if filter.ProviderID != "" {
+		q = q.Where("provider_id = ?", filter.ProviderID)
+	}
+	if filter.AIRequestID != "" {
+		q = q.Where("ai_request_id = ?", filter.AIRequestID)
+	}
+	var runs []ProbeRun
+	if err := q.Order("started_at DESC, id DESC").Limit(limit).Find(&runs).Error; err != nil {
+		return nil, fmt.Errorf("probe_runs: list manual: %w", err)
+	}
+	return runs, nil
 }
 
 // Close is a no-op for the shared-handle case. We don't close the underlying

@@ -219,6 +219,12 @@ type RequestError struct {
 	// ResponseBody 是失败响应体（已按 DefaultErrorBodyCapture 截断）。
 	// 非 4xx / 5xx 时为空。
 	ResponseBody string
+	// StatusCode 是上游返回的 HTTP 状态码。0 表示请求根本没拿到响应
+	// （DNS 失败 / 连接被拒 / TLS 握手失败 / 超时）。
+	//
+	// 单独记一份而不是让人去解析错误消息：服务商管理需要把 "404 模型不
+	// 存在" 和 "401 key 无效" 明确区分开，这两者的处置方式完全不同。
+	StatusCode int
 	// Err 是底层错误。
 	Err error
 }
@@ -240,11 +246,14 @@ func (e *RequestError) Unwrap() error {
 }
 
 // NewRequestError 构造一个携带请求上下文的错误。
-func NewRequestError(requestID string, reqBody []byte, respBody string, err error) *RequestError {
+//
+// statusCode 是上游返回的 HTTP 状态码；请求根本没拿到响应时传 0。
+func NewRequestError(requestID string, reqBody []byte, respBody string, statusCode int, err error) *RequestError {
 	return &RequestError{
 		RequestID:    requestID,
 		RequestBody:  reqBody,
 		ResponseBody: respBody,
+		StatusCode:   statusCode,
 		Err:          err,
 	}
 }

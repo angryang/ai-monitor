@@ -33,6 +33,7 @@ var Defaults = struct {
 	BucketsITL           []float64
 	BucketsDuration      []float64
 	BucketsLag           []float64
+	ProviderCheckTimeout time.Duration
 }{
 	HTTPAddr:             ":9090",
 	SQLitePath:           "ai-monitor.db",
@@ -49,6 +50,7 @@ var Defaults = struct {
 	BucketsITL:           []float64{.005, .01, .025, .05, .1, .25, .5},
 	BucketsDuration:      []float64{.1, .25, .5, 1, 2.5, 5, 10, 20, 30, 60, 120},
 	BucketsLag:           []float64{.01, .05, .1, .5, 1, 5, 30, 60},
+	ProviderCheckTimeout: 10 * time.Second,
 }
 
 // Config is the runtime configuration loaded at startup.
@@ -84,6 +86,13 @@ type Config struct {
 	// Security note: skipping verification removes MITM protection. Prefer
 	// the per-task TaskConfig.InsecureSkipVerify where possible.
 	InsecureSkipVerify bool `yaml:"insecure_skip_verify"`
+	// ProviderCheckTimeout bounds one AI-provider connectivity check.
+	//
+	// The check is part of the save path: a provider is only persisted
+	// after the upstream accepted a request. The value therefore also
+	// bounds how long the admin API may hold a write request open, and
+	// the HTTP server's write timeout is raised to match.
+	ProviderCheckTimeout time.Duration `yaml:"provider_check_timeout"`
 	// Tasks lists tasks initially seeded into SQLite. Optional.
 	Tasks []TaskConfig `yaml:"tasks"`
 }
@@ -128,16 +137,16 @@ func Load(path string, flags FlagOverrides) (*Config, error) {
 // FlagOverrides holds optional command-line overrides. A nil/zero-valued field
 // means "no override" — the loader leaves the previous layer's value alone.
 type FlagOverrides struct {
-	MasterKey        string
-	SQLitePath       string
-	HTTPAddr         string
-	MaxConcurrent    int
-	Jitter           time.Duration
-	SlowThreshold    time.Duration
-	ConsecFailureN   int
-	SuccessRateW     int
-	SuccessRateThr   float64
-	DedupTTL         time.Duration
+	MasterKey      string
+	SQLitePath     string
+	HTTPAddr       string
+	MaxConcurrent  int
+	Jitter         time.Duration
+	SlowThreshold  time.Duration
+	ConsecFailureN int
+	SuccessRateW   int
+	SuccessRateThr float64
+	DedupTTL       time.Duration
 	// InsecureSkipVerify is a pointer because a plain bool can't express
 	// "not passed" vs "explicitly false". Nil means "no override".
 	InsecureSkipVerify *bool
@@ -160,6 +169,7 @@ func zeroFromDefaults() *Config {
 		BucketsITL:           append([]float64(nil), Defaults.BucketsITL...),
 		BucketsDuration:      append([]float64(nil), Defaults.BucketsDuration...),
 		BucketsLag:           append([]float64(nil), Defaults.BucketsLag...),
+		ProviderCheckTimeout: Defaults.ProviderCheckTimeout,
 	}
 	return c
 }
@@ -192,6 +202,11 @@ func applyEnv(c *Config) {
 	if v := os.Getenv("AI_MONITOR_INSECURE_SKIP_VERIFY"); v != "" {
 		if b, err := strconv.ParseBool(v); err == nil {
 			c.InsecureSkipVerify = b
+		}
+	}
+	if v := os.Getenv("AI_MONITOR_PROVIDER_CHECK_TIMEOUT"); v != "" {
+		if d, err := time.ParseDuration(v); err == nil {
+			c.ProviderCheckTimeout = d
 		}
 	}
 }
@@ -280,6 +295,9 @@ func (c *Config) Validate() error {
 	}
 	if !strings.HasPrefix(c.HTTPAddr, ":") && !strings.Contains(c.HTTPAddr, ":") {
 		return fmt.Errorf("config: http_addr must be a host:port string")
+	}
+	if c.ProviderCheckTimeout <= 0 {
+		return fmt.Errorf("config: provider_check_timeout must be > 0")
 	}
 	return nil
 }
